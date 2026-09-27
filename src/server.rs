@@ -25,7 +25,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::clock::Clock;
 use crate::config::{Backend, Config};
+use crate::errors::{self, Captured, ErrorBody, Resource};
 use crate::lenient;
 use crate::logic::{checksum, validate};
 use crate::service::{self, GarbageBin};
@@ -37,6 +39,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// A running server. Dropping it leaves the server running; call `shutdown`.
 pub struct ServerHandle {
     pub local_addr: SocketAddr,
+    /// Object Lock's clock; tests move it to expire retention.
+    pub clock: Arc<Clock>,
     stop: oneshot::Sender<()>,
     task: JoinHandle<()>,
 }
@@ -52,9 +56,10 @@ impl ServerHandle {
 /// Opens the backend, creates init buckets, binds, and serves in the background.
 /// Once this returns, `/health` answers 200.
 pub async fn start(config: &Config) -> anyhow::Result<ServerHandle> {
+    let clock = Arc::new(Clock::new(config.now));
     let s3 = match config.backend {
-        Backend::Memory => build(MemoryStorage::new(), config).await?,
-        Backend::Fs => build(FsStorage::open(&config.data_dir)?, config).await?,
+        Backend::Memory => build(MemoryStorage::new(), config, &clock).await?,
+        Backend::Fs => build(FsStorage::open(&config.data_dir)?, config, &clock).await?,
     };
     let app = Arc::new(App {
         s3,
@@ -75,6 +80,7 @@ pub async fn start(config: &Config) -> anyhow::Result<ServerHandle> {
     );
     Ok(ServerHandle {
         local_addr,
+        clock,
         stop,
         task,
     })
@@ -103,7 +109,11 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn build<S: Storage>(storage: S, config: &Config) -> anyhow::Result<S3Service> {
+async fn build<S: Storage>(
+    storage: S,
+    config: &Config,
+    clock: &Arc<Clock>,
+) -> anyhow::Result<S3Service> {
     for bucket in config
         .init_buckets
         .iter()
@@ -120,7 +130,8 @@ async fn build<S: Storage>(storage: S, config: &Config) -> anyhow::Result<S3Serv
         }
     }
 
-    let mut builder = S3ServiceBuilder::new(GarbageBin::new(storage, config.region.clone()));
+    let gb = GarbageBin::new(storage, config.region.clone(), Arc::clone(clock));
+    let mut builder = S3ServiceBuilder::new(gb);
     if let Some(domain) = &config.vhost_domain {
         let host = SingleDomain::new(domain)
             .with_context(|| format!("invalid vhost domain {domain:?}"))?
@@ -191,6 +202,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Body>,
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned);
 
+    let captured = Captured::default();
     let mut resp = if is_health(&req, &app) {
         text(StatusCode::OK, "ok\n")
     } else {
@@ -198,13 +210,14 @@ async fn handle(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Body>,
         if app.lenient {
             lenient::strip_auth(&mut req);
         }
+        req.extensions_mut().insert(captured.clone());
         match verify_xml_body(&mut req).await {
-            Err(e) => s3_error(&e),
+            Err(e) => error_response(&e, &captured),
             Ok(()) => match app.s3.call(req).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     warn!(error = %e, "internal error");
-                    text(StatusCode::INTERNAL_SERVER_ERROR, "internal error\n")
+                    error_response(&S3Error::new(S3ErrorCode::InternalError), &captured)
                 }
             },
         }
@@ -218,9 +231,18 @@ async fn handle(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Body>,
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
     }
     let status = resp.status();
-    if status.is_client_error() || status.is_server_error() {
-        let target = target(host.as_deref(), &path, app.vhost_domain.as_deref());
-        enrich_error(&mut resp, &request_id, target);
+    if (status.is_client_error() || status.is_server_error()) && method != Method::HEAD {
+        let body = captured
+            .take()
+            .or_else(|| resp.body().bytes().and_then(|b| ErrorBody::decode(&b)));
+        if let Some(body) = body {
+            let target = target(host.as_deref(), &path, app.vhost_domain.as_deref());
+            let xml = errors::render(&body, &target, &request_id);
+            let headers = resp.headers_mut();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+            headers.insert(CONTENT_LENGTH, HeaderValue::from(xml.len()));
+            *resp.body_mut() = Body::from(xml);
+        }
     }
     let headers = resp.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&request_id) {
@@ -247,7 +269,13 @@ async fn handle(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Body>,
 
 /// Subresources whose XML request bodies carry `Content-MD5` or `x-amz-checksum-*`.
 /// s3s parses these bodies before the service sees them, so they are checked here.
-const CHECKSUMMED_XML: &[&str] = &["delete", "tagging"];
+const CHECKSUMMED_XML: &[&str] = &[
+    "delete",
+    "tagging",
+    "object-lock",
+    "retention",
+    "legal-hold",
+];
 
 async fn verify_xml_body(req: &mut Request<Body>) -> Result<(), S3Error> {
     let has_digest = |h: &http::HeaderMap| {
@@ -277,17 +305,14 @@ async fn verify_xml_body(req: &mut Request<Body>) -> Result<(), S3Error> {
     checksum::verify_body(req.headers(), &body).map_err(service::digest_error)
 }
 
-/// An S3 error response built outside s3s; `enrich_error` adds the ids.
-fn s3_error(e: &S3Error) -> Response<Body> {
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{}</Code><Message>{}</Message></Error>",
-        xml_escape(e.code().as_str()),
-        xml_escape(e.message().unwrap_or_default()),
-    );
-    let mut resp = Response::new(Body::from(xml));
-    *resp.status_mut() = e.status_code().unwrap_or(StatusCode::BAD_REQUEST);
-    resp.headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+/// An S3 error response built outside s3s; its body is rendered with the rest.
+fn error_response(e: &S3Error, captured: &Captured) -> Response<Body> {
+    captured.set(e);
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = e.status_code().unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if let Some(h) = e.headers() {
+        resp.headers_mut().extend(h.clone());
+    }
     resp
 }
 
@@ -299,12 +324,14 @@ fn new_request_id() -> String {
     id[..16].to_owned()
 }
 
-/// `/health` and `/ready` on the bare endpoint (not a virtual-hosted bucket).
+/// Unsigned `GET`/`HEAD` of `/health` or `/ready` on the bare endpoint. A signed
+/// request is S3 (HeadBucket, ListObjects), so buckets with those names still work.
 fn is_health<B>(req: &Request<B>, app: &App) -> bool {
     let path = req.uri().path();
     (req.method() == Method::GET || req.method() == Method::HEAD)
         && (path == "/health" || path == "/ready")
         && req.uri().query().is_none()
+        && !req.headers().contains_key(http::header::AUTHORIZATION)
         && vhost_bucket(
             req.headers().get(HOST).and_then(|h| h.to_str().ok()),
             app.vhost_domain.as_deref(),
@@ -332,11 +359,7 @@ fn vhost_bucket<'a>(host: Option<&'a str>, domain: Option<&str>) -> Option<&'a s
 }
 
 /// Bucket and key a request addresses, for error bodies.
-fn target(
-    host: Option<&str>,
-    path: &str,
-    domain: Option<&str>,
-) -> (Option<String>, Option<String>) {
+fn target(host: Option<&str>, path: &str, domain: Option<&str>) -> Resource {
     let path = percent_decode(path.strip_prefix('/').unwrap_or(path));
     let (bucket, key) = match vhost_bucket(host, domain) {
         Some(b) => (b.to_owned(), path),
@@ -346,7 +369,10 @@ fn target(
         },
     };
     let some = |s: String| (!s.is_empty()).then_some(s);
-    (some(bucket), some(key))
+    Resource {
+        bucket: some(bucket),
+        key: some(key),
+    }
 }
 
 fn percent_decode(s: &str) -> String {
@@ -369,50 +395,6 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-/// Adds `Key`/`BucketName`, `RequestId` and `HostId` to an S3 error body.
-fn enrich_error(
-    resp: &mut Response<Body>,
-    request_id: &str,
-    (bucket, key): (Option<String>, Option<String>),
-) {
-    let Some(body) = resp.body().bytes() else {
-        return;
-    };
-    let Ok(xml) = std::str::from_utf8(&body) else {
-        return;
-    };
-    let Some(end) = xml.rfind("</Error>") else {
-        return;
-    };
-    let mut extra = String::new();
-    if xml.contains("<Code>NoSuchKey</Code>")
-        && let Some(k) = key
-    {
-        extra += &format!("<Key>{}</Key>", xml_escape(&k));
-    }
-    if (xml.contains("<Code>NoSuchBucket</Code>") || xml.contains("<Code>BucketNotEmpty</Code>"))
-        && let Some(b) = bucket
-    {
-        extra += &format!("<BucketName>{}</BucketName>", xml_escape(&b));
-    }
-    if !xml.contains("<RequestId>") {
-        extra += &format!("<RequestId>{request_id}</RequestId>");
-    }
-    extra += &format!("<HostId>{request_id}</HostId>");
-    let new = format!("{}{extra}{}", &xml[..end], &xml[end..]);
-    resp.headers_mut()
-        .insert(CONTENT_LENGTH, HeaderValue::from(new.len()));
-    *resp.body_mut() = Body::from(new);
 }
 
 #[cfg(test)]
@@ -439,7 +421,10 @@ mod tests {
 
     #[test]
     fn targets() {
-        let t = |h, p, d| target(h, p, d);
+        let t = |h, p, d| {
+            let r = target(h, p, d);
+            (r.bucket, r.key)
+        };
         assert_eq!(
             t(None, "/b/a%20b/c", None),
             (Some("b".into()), Some("a b/c".into()))
@@ -450,16 +435,5 @@ mod tests {
             (Some("b".into()), Some("k".into()))
         );
         assert_eq!(t(None, "/", None), (None, None));
-    }
-
-    #[test]
-    fn error_enrichment() {
-        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><Message>m</Message></Error>";
-        let mut resp = Response::new(Body::from(xml.to_owned()));
-        enrich_error(&mut resp, "RID", (Some("b".into()), Some("a&b".into())));
-        let body = String::from_utf8(resp.body().bytes().unwrap().to_vec()).unwrap();
-        assert!(body.ends_with(
-            "<Message>m</Message><Key>a&amp;b</Key><RequestId>RID</RequestId><HostId>RID</HostId></Error>"
-        ));
     }
 }

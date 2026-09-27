@@ -8,6 +8,48 @@ use crate::storage::{ObjectMeta, Result, Storage};
 
 const BATCH: usize = 1000;
 
+/// The ordered scans listing needs from a backend.
+#[async_trait::async_trait]
+trait Scan: Sync {
+    async fn objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, ObjectMeta)>>;
+    async fn versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<ObjectMeta>)>>;
+}
+
+#[async_trait::async_trait]
+impl<S: Storage> Scan for S {
+    async fn objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, ObjectMeta)>> {
+        self.list_objects(bucket, prefix, after, limit).await
+    }
+
+    async fn versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<ObjectMeta>)>> {
+        self.list_versions(bucket, prefix, after, limit).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     Object(String, Box<ObjectMeta>),
@@ -50,8 +92,8 @@ pub async fn list<S: Storage>(
     list_batched(s, bucket, prefix, delimiter, marker, max_keys, BATCH).await
 }
 
-async fn list_batched<S: Storage>(
-    s: &S,
+async fn list_batched(
+    s: &impl Scan,
     bucket: &str,
     prefix: &str,
     delimiter: Option<&str>,
@@ -62,29 +104,15 @@ async fn list_batched<S: Storage>(
     let mut page = Page::default();
     let mut after = marker.map(|m| skip_group(m, prefix, delimiter));
     loop {
-        let objects = s
-            .list_objects(bucket, prefix, after.as_deref(), batch)
-            .await?;
+        let objects = s.objects(bucket, prefix, after.as_deref(), batch).await?;
         let exhausted = objects.len() < batch;
-        let mut restart = false;
         for (key, meta) in objects {
             after = Some(key.clone());
             let entry = match common_prefix(&key, prefix, delimiter) {
-                Some(cp) => {
-                    let cp = cp.to_owned();
-                    // Jump past the rest of this group.
-                    let jump = skip_group(&cp, prefix, delimiter);
-                    if jump > key {
-                        after = Some(jump);
-                    }
-                    Entry::Prefix(cp)
-                }
+                Some(cp) => Entry::Prefix(cp.to_owned()),
                 None => Entry::Object(key, Box::new(meta)),
             };
-            if marker.is_some_and(|m| entry.name() <= m) {
-                continue;
-            }
-            if page.entries.last().is_some_and(|e| e == &entry) {
+            if marker.is_some_and(|m| entry.name() <= m) || page.entries.last() == Some(&entry) {
                 continue;
             }
             if page.entries.len() == max_keys {
@@ -93,13 +121,24 @@ async fn list_batched<S: Storage>(
                 return Ok(page);
             }
             page.entries.push(entry);
-            if matches!(page.entries.last(), Some(Entry::Prefix(_))) {
-                restart = true;
-                break;
-            }
         }
-        if exhausted && !restart {
+        if exhausted {
             return Ok(page);
+        }
+        if let Some(Entry::Prefix(cp)) = page.entries.last() {
+            seek_past(&mut after, cp, prefix, delimiter);
+        }
+    }
+}
+
+/// Moves a scan position inside group `cp` past the rest of the group.
+fn seek_past(after: &mut Option<String>, cp: &str, prefix: &str, delimiter: Option<&str>) {
+    if let Some(a) = after.as_deref()
+        && a.starts_with(cp)
+    {
+        let jump = skip_group(cp, prefix, delimiter);
+        if jump.as_str() > a {
+            *after = Some(jump);
         }
     }
 }
@@ -169,8 +208,8 @@ pub async fn list_versions<S: Storage>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn list_versions_batched<S: Storage>(
-    s: &S,
+async fn list_versions_batched(
+    s: &impl Scan,
     bucket: &str,
     prefix: &str,
     delimiter: Option<&str>,
@@ -186,7 +225,7 @@ async fn list_versions_batched<S: Storage>(
         && common_prefix(km, prefix, delimiter).is_none()
     {
         // The smallest key starting with `km` is `km` itself.
-        let first = s.list_versions(bucket, km, None, 1).await?;
+        let first = s.versions(bucket, km, None, 1).await?;
         if let Some((key, versions)) = first.into_iter().find(|(k, _)| k == km)
             && let Some(pos) = versions.iter().position(|m| m.version_id == vm)
         {
@@ -204,29 +243,20 @@ async fn list_versions_batched<S: Storage>(
     }
     let mut after = key_marker.map(|m| skip_group(m, prefix, delimiter));
     loop {
-        let keys = s
-            .list_versions(bucket, prefix, after.as_deref(), batch)
-            .await?;
+        let keys = s.versions(bucket, prefix, after.as_deref(), batch).await?;
         let exhausted = keys.len() < batch;
-        let mut restart = false;
         for (key, versions) in keys {
             after = Some(key.clone());
             if let Some(cp) = common_prefix(&key, prefix, delimiter) {
-                let cp = cp.to_owned();
-                let jump = skip_group(&cp, prefix, delimiter);
-                if jump > key {
-                    after = Some(jump);
-                }
-                if key_marker.is_some_and(|m| cp.as_str() <= m)
-                    || matches!(page.entries.last(), Some(VersionEntry::Prefix(p)) if *p == cp)
+                if key_marker.is_some_and(|m| cp <= m)
+                    || matches!(page.entries.last(), Some(VersionEntry::Prefix(p)) if p == cp)
                 {
                     continue;
                 }
-                if !page.push(VersionEntry::Prefix(cp), max_keys) {
+                if !page.push(VersionEntry::Prefix(cp.to_owned()), max_keys) {
                     return Ok(page);
                 }
-                restart = true;
-                break;
+                continue;
             }
             for (i, meta) in versions.into_iter().enumerate() {
                 let e = VersionEntry::Version {
@@ -239,8 +269,11 @@ async fn list_versions_batched<S: Storage>(
                 }
             }
         }
-        if exhausted && !restart {
+        if exhausted {
             return Ok(page);
+        }
+        if let Some(VersionEntry::Prefix(cp)) = page.entries.last() {
+            seek_past(&mut after, cp, prefix, delimiter);
         }
     }
 }
@@ -479,6 +512,55 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// Counts backend scans.
+    struct Counting(MemoryStorage, std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Scan for Counting {
+        async fn objects(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<(String, ObjectMeta)>> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.0.objects(bucket, prefix, after, limit).await
+        }
+
+        async fn versions(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<(String, Vec<ObjectMeta>)>> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.0.versions(bucket, prefix, after, limit).await
+        }
+    }
+
+    #[test]
+    fn one_scan_per_batch() {
+        rt().block_on(async {
+            let keys: Vec<String> = ["a/1", "a/2", "b", "c/1", "c/2", "d"]
+                .map(String::from)
+                .to_vec();
+            let s = Counting(store(&keys).await, Default::default());
+            let page = list_batched(&s, "b", "", Some("/"), None, 1000, 100)
+                .await
+                .unwrap();
+            let names: Vec<_> = page.entries.iter().map(|e| e.name()).collect();
+            assert_eq!(names, ["a/", "b", "c/", "d"]);
+            assert_eq!(s.1.swap(0, std::sync::atomic::Ordering::Relaxed), 1);
+            let page = list_versions_batched(&s, "b", "", Some("/"), None, None, 1000, 100)
+                .await
+                .unwrap();
+            assert_eq!(page.entries.len(), 4);
+            assert_eq!(s.1.load(std::sync::atomic::Ordering::Relaxed), 1);
+        });
     }
 
     #[test]

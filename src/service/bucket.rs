@@ -4,7 +4,7 @@ use s3s::{S3ErrorCode, S3Request, S3Response, S3Result};
 use super::{GarbageBin, error, invalid_argument, owner, storage_err, ts};
 use crate::logic::listing;
 use crate::logic::validate;
-use crate::storage::{Storage, StorageError};
+use crate::storage::{BucketInfo, ObjectLock, Storage, StorageError, Versioning};
 
 const US_EAST_1: &str = "us-east-1";
 const MAX_BUCKETS: i32 = 10_000;
@@ -13,6 +13,7 @@ pub async fn create_bucket<S: Storage>(
     gb: &GarbageBin<S>,
     req: S3Request<CreateBucketInput>,
 ) -> S3Result<S3Response<CreateBucketOutput>> {
+    let lock = req.input.object_lock_enabled_for_bucket.unwrap_or(false);
     let bucket = req.input.bucket;
     if !validate::bucket_name(&bucket) {
         return Err(error(
@@ -21,6 +22,17 @@ pub async fn create_bucket<S: Storage>(
         ));
     }
     match gb.storage.create_bucket(&bucket).await {
+        Ok(()) if lock => {
+            let f = Box::new(|b: &mut BucketInfo| {
+                b.versioning = Some(Versioning::Enabled);
+                b.object_lock = Some(ObjectLock::default());
+                Ok(())
+            });
+            gb.storage
+                .update_bucket(&bucket, f)
+                .await
+                .map_err(storage_err)?;
+        }
         Ok(()) => {}
         // us-east-1 answers a repeat create by the owner with 200.
         Err(StorageError::BucketAlreadyOwnedByYou) if gb.region == US_EAST_1 => {}

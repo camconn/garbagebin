@@ -25,6 +25,8 @@ aws --endpoint-url http://localhost:9000 s3 ls s3://my-bucket
 Any credentials work unless strict auth is on (`S3_STRICT_AUTH=true` checks them against `S3_ACCESS_KEY` /
 `S3_SECRET_KEY`). Use path-style addressing, or set `S3_VHOST_DOMAIN` for virtual-host style. `GET /health`
 returns 200 once the server is ready.
+`S3_NOW` (an RFC 3339 instant) fixes the clock Object Lock judges retention by, so retention tests are
+deterministic.
 
 ### docker-compose
 

@@ -51,6 +51,9 @@ pub enum StorageError {
     /// Reading the request body failed; the source is the stream's error.
     #[error("request body: {0}")]
     Body(io::Error),
+    /// An update or delete check declined the change; nothing was written.
+    #[error("refused: {0}")]
+    Refused(Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Io(io::Error),
     #[error("{0}")]
@@ -121,6 +124,11 @@ pub struct ObjectMeta {
     /// `x-amz-storage-class` other than `STANDARD`, stored only to be echoed back.
     #[serde(default)]
     pub storage_class: Option<String>,
+    #[serde(default)]
+    pub retention: Option<Retention>,
+    /// `None` if never set; AWS tells that apart from `OFF`.
+    #[serde(default)]
+    pub legal_hold: Option<bool>,
 }
 
 impl ObjectMeta {
@@ -144,6 +152,8 @@ impl ObjectMeta {
             upload_id: None,
             sse: Sse::default(),
             storage_class: None,
+            retention: None,
+            legal_hold: None,
         }
     }
 
@@ -163,6 +173,32 @@ pub enum Versioning {
     Suspended,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LockMode {
+    Governance,
+    Compliance,
+}
+
+/// Object Lock retention of one version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retention {
+    pub mode: LockMode,
+    pub until: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionPeriod {
+    Days(u32),
+    Years(u32),
+}
+
+/// A bucket's Object Lock configuration; having one means lock is enabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLock {
+    /// Applied to new versions written without explicit retention.
+    pub default_retention: Option<(LockMode, RetentionPeriod)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketInfo {
     pub name: String,
@@ -170,6 +206,8 @@ pub struct BucketInfo {
     pub tags: Tags,
     #[serde(default)]
     pub versioning: Option<Versioning>,
+    #[serde(default)]
+    pub object_lock: Option<ObjectLock>,
 }
 
 impl BucketInfo {
@@ -179,14 +217,24 @@ impl BucketInfo {
             created: SystemTime::now(),
             tags: Tags::new(),
             versioning: None,
+            object_lock: None,
         }
     }
 }
 
 /// An in-place edit of a bucket row, applied atomically; an error aborts it.
 pub type BucketUpdate = Box<dyn FnOnce(&mut BucketInfo) -> Result<()> + Send>;
-/// An in-place edit of a version row (tags, and later lock fields), applied atomically.
+/// An in-place edit of a version row (tags, lock fields), applied atomically.
 pub type MetaUpdate = Box<dyn FnOnce(&mut ObjectMeta) -> Result<()> + Send>;
+/// Decides, atomically with the delete, whether a version may be removed.
+pub type DeleteCheck = Box<dyn FnOnce(&ObjectMeta) -> Result<()> + Send>;
+/// Decides, atomically with a write, whether it may go ahead given the key's
+/// current version (`None` if there is none or it is a delete marker).
+pub type WriteCheck = Box<dyn FnOnce(Option<&ObjectMeta>) -> Result<()> + Send>;
+
+pub(crate) fn no_check() -> WriteCheck {
+    Box::new(|_| Ok(()))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadInfo {
@@ -245,6 +293,19 @@ pub(crate) mod versions {
     pub fn remove<B>(list: &mut Vec<Stored<B>>, id: &str) -> Option<Stored<B>> {
         let i = list.iter().position(|v| v.meta.version_id == id)?;
         Some(list.remove(i))
+    }
+
+    /// `remove`, unless `check` refuses the version.
+    pub fn remove_if<B>(
+        list: &mut Vec<Stored<B>>,
+        id: &str,
+        check: super::DeleteCheck,
+    ) -> Result<Option<Stored<B>>> {
+        let Some(i) = list.iter().position(|v| v.meta.version_id == id) else {
+            return Ok(None);
+        };
+        check(&list[i].meta)?;
+        Ok(Some(list.remove(i)))
     }
 
     fn position<B>(list: &[Stored<B>], id: Option<&str>) -> Result<usize> {
@@ -323,9 +384,32 @@ pub trait Storage: Send + Sync + 'static {
         key: &str,
         blob: Self::Blob,
         meta: ObjectMeta,
+    ) -> Result<()> {
+        self.put_object_if(bucket, key, blob, meta, no_check())
+            .await
+    }
+    /// `put_object`, unless `check` returns an error; that error is returned and nothing changes.
+    async fn put_object_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        blob: Self::Blob,
+        meta: ObjectMeta,
+        check: WriteCheck,
     ) -> Result<()>;
     /// Adds delete marker `meta` as the current version of `key`.
-    async fn put_delete_marker(&self, bucket: &str, key: &str, meta: ObjectMeta) -> Result<()>;
+    async fn put_delete_marker(&self, bucket: &str, key: &str, meta: ObjectMeta) -> Result<()> {
+        self.put_delete_marker_if(bucket, key, meta, no_check())
+            .await
+    }
+    /// `put_delete_marker`, unless `check` returns an error.
+    async fn put_delete_marker_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        meta: ObjectMeta,
+        check: WriteCheck,
+    ) -> Result<()>;
     async fn head_object(
         &self,
         bucket: &str,
@@ -345,6 +429,18 @@ pub trait Storage: Send + Sync + 'static {
         bucket: &str,
         key: &str,
         version_id: &str,
+    ) -> Result<Option<ObjectMeta>> {
+        self.delete_version_if(bucket, key, version_id, Box::new(|_| Ok(())))
+            .await
+    }
+    /// `delete_version`, unless `check` returns an error for the version; that error
+    /// is returned and nothing changes.
+    async fn delete_version_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        check: DeleteCheck,
     ) -> Result<Option<ObjectMeta>>;
     /// Adds version `meta` of `dst` sharing the blob of `src`'s version `src_version`;
     /// no bytes move. `PreconditionFailed` if its ETag is no longer `src_etag`.
@@ -389,6 +485,8 @@ pub trait Storage: Send + Sync + 'static {
     // Multipart.
 
     async fn create_upload(&self, bucket: &str, upload: UploadInfo) -> Result<()>;
+    /// The upload, without its parts.
+    async fn get_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<UploadInfo>;
     /// Stores or replaces part `part.part_number`.
     async fn put_part(
         &self,
@@ -416,6 +514,20 @@ pub trait Storage: Send + Sync + 'static {
         upload_id: &str,
         parts: &[PartInfo],
         meta: ObjectMeta,
+    ) -> Result<()> {
+        self.complete_upload_if(bucket, key, upload_id, parts, meta, no_check())
+            .await
+    }
+    /// `complete_upload`, unless `check` returns an error; the upload is then kept.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_upload_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[PartInfo],
+        meta: ObjectMeta,
+        check: WriteCheck,
     ) -> Result<()>;
     async fn abort_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()>;
 }

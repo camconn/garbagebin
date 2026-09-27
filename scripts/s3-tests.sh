@@ -36,7 +36,6 @@ MARKERS=(
   bucket_policy user_policy role_policy session_policy group group_policy object_ownership
   encryption bucket_encryption sse_s3
   lifecycle lifecycle_expiration lifecycle_transition cloud_transition cloud_restore target_by_bucket storage_class
-  object_lock
   iam_account iam_cross_account iam_role iam_tenant iam_user
   test_of_sts webidentity_test token_claims_trust_policy_test token_principal_tag_role_policy_test
   token_request_tag_trust_policy_test token_resource_tags_test token_role_tags_test token_tag_keys_test

@@ -1,21 +1,25 @@
 use s3s::dto::{
     self, ChecksumMode, ChecksumType, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
     CopySource, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
-    DeletedObject, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    MetadataDirective, PutObjectInput, PutObjectOutput, ServerSideEncryption, StorageClass,
-    StreamingBlob, TaggingDirective,
+    DeletedObject, ETagCondition, GetObjectInput, GetObjectOutput, HeadObjectInput,
+    HeadObjectOutput, MetadataDirective, PutObjectInput, PutObjectOutput, ServerSideEncryption,
+    StorageClass, StreamingBlob, TaggingDirective,
 };
 use s3s::{S3ErrorCode, S3Request, S3Response, S3Result};
 
 use super::{
     DEFAULT_CONTENT_TYPE, GarbageBin, Trailers, Upload, algorithm, check_conditions, check_key,
-    content_encoding, error, etag, etag_matches, expected_checksums, full_object, new_version_id,
-    now, parse_tagging_header, precondition_failed, read_err, storage_class, storage_err, ts,
-    version_param, write_version, written_version,
+    content_encoding, error, etag, etag_matches, expected_checksums, full_object, lock,
+    new_version_id, now, parse_tagging_header, precondition_failed, read_err, storage_class,
+    storage_err, ts, version_param, write_version, written_version,
 };
+use futures::TryStreamExt;
+
+use crate::logic::checksum::{self, Algorithm};
 use crate::logic::etag as etag_fmt;
 use crate::storage::{
-    BucketInfo, Checksums, NULL_VERSION, ObjectMeta, Sse, Storage, StorageError, Versioning,
+    BucketInfo, Checksums, DeleteCheck, NULL_VERSION, ObjectMeta, Sse, Storage, StorageError,
+    Versioning, WriteCheck,
 };
 
 pub async fn put_object<S: Storage>(
@@ -29,12 +33,20 @@ pub async fn put_object<S: Storage>(
     let storage_class = storage_class(input.storage_class.as_ref())?;
     // Fail fast before reading a body we cannot store.
     let info = gb.require_bucket(&input.bucket).await?;
-    super::check_write_conditions(
+    let lock_now = gb.clock.now();
+    let (retention, legal_hold) = lock::from_headers(
+        &info,
+        input.object_lock_mode.as_ref(),
+        input.object_lock_retain_until_date.as_ref(),
+        input.object_lock_legal_hold_status.as_ref(),
+        lock_now,
+    )?;
+    let check = super::check_write_conditions(
         gb,
         &input.bucket,
         &input.key,
-        input.if_match.as_ref(),
-        input.if_none_match.as_ref(),
+        input.if_match,
+        input.if_none_match,
     )
     .await?;
 
@@ -83,9 +95,11 @@ pub async fn put_object<S: Storage>(
         upload_id: None,
         sse,
         storage_class,
+        retention: retention.or_else(|| lock::default_retention(&info, lock_now)),
+        legal_hold,
     };
     gb.storage
-        .put_object(&input.bucket, &input.key, blob, meta.clone())
+        .put_object_if(&input.bucket, &input.key, blob, meta.clone(), check)
         .await
         .map_err(storage_err)?;
 
@@ -131,6 +145,11 @@ macro_rules! object_headers {
         $out.sse_customer_key_md5 = m.sse.customer_key_md5.clone();
         $out.bucket_key_enabled = m.sse.bucket_key_enabled;
         $out.storage_class = m.storage_class.clone().map(StorageClass::from);
+        (
+            $out.object_lock_mode,
+            $out.object_lock_retain_until_date,
+            $out.object_lock_legal_hold_status,
+        ) = lock::headers(m);
         if $with_checksums {
             let c = &m.checksums;
             $out.checksum_crc32 = c.crc32.clone();
@@ -283,35 +302,60 @@ struct Deletion {
 
 /// DELETE of `version`, or of the current version per the bucket's versioning state:
 /// unversioned removes the null version, otherwise a delete marker is added.
+/// Removing a version Object Lock protects is refused; `bypass` lifts GOVERNANCE retention.
+/// `if_match` is checked atomically with the delete; unlike a conditional PUT (404),
+/// a missing version fails it (RFC 9110).
 async fn delete_one<S: Storage>(
     gb: &GarbageBin<S>,
     info: &BucketInfo,
     key: &str,
     version: Option<&str>,
+    bypass: bool,
+    if_match: Option<ETagCondition>,
 ) -> Result<Deletion, StorageError> {
     let bucket = &info.name;
-    if let Some(v) = version {
-        let removed = gb.storage.delete_version(bucket, key, v).await?;
-        let dm = removed.is_some_and(|m| m.delete_marker);
+    let lock_now = gb.clock.now();
+    let holds = |c: &Option<ETagCondition>, m: &ObjectMeta| {
+        c.as_ref()
+            .is_none_or(|c| !m.delete_marker && etag_matches(c, m))
+    };
+    let target = match (version, info.versioning) {
+        (Some(v), _) => Some(v),
+        (None, None) => Some(NULL_VERSION),
+        (None, Some(_)) => None,
+    };
+    if let Some(v) = target {
+        let cond = if_match.clone();
+        let check: DeleteCheck = Box::new(move |m| {
+            if !holds(&cond, m) {
+                return Err(StorageError::PreconditionFailed);
+            }
+            lock::check_delete(m, lock_now, bypass).map_err(lock::refused)
+        });
+        let removed = gb.storage.delete_version_if(bucket, key, v, check).await?;
+        if if_match.is_some() && removed.is_none() {
+            return Err(StorageError::PreconditionFailed);
+        }
+        let dm = version.is_some() && removed.is_some_and(|m| m.delete_marker);
         return Ok(Deletion {
-            version_id: Some(v.to_owned()),
+            version_id: version.map(str::to_owned),
             marker: dm.then(|| v.to_owned()),
         });
     }
     let id = match info.versioning {
-        None => {
-            gb.storage.delete_version(bucket, key, NULL_VERSION).await?;
-            return Ok(Deletion {
-                version_id: None,
-                marker: None,
-            });
-        }
         Some(Versioning::Enabled) => new_version_id(),
-        Some(Versioning::Suspended) => NULL_VERSION.to_owned(),
+        _ => NULL_VERSION.to_owned(),
     };
     let mut meta = ObjectMeta::delete_marker(id.clone());
     meta.last_modified = now();
-    gb.storage.put_delete_marker(bucket, key, meta).await?;
+    let check: WriteCheck = Box::new(move |m| match m {
+        Some(m) if holds(&if_match, m) => Ok(()),
+        None if if_match.is_none() => Ok(()),
+        _ => Err(StorageError::PreconditionFailed),
+    });
+    gb.storage
+        .put_delete_marker_if(bucket, key, meta, check)
+        .await?;
     Ok(Deletion {
         version_id: None,
         marker: Some(id),
@@ -322,23 +366,11 @@ pub async fn delete_object<S: Storage>(
     gb: &GarbageBin<S>,
     req: S3Request<DeleteObjectInput>,
 ) -> S3Result<S3Response<DeleteObjectOutput>> {
-    let i = &req.input;
+    let i = req.input;
     let version = version_param(i.version_id.as_ref())?;
-    if let Some(cond) = &i.if_match {
-        // Unlike a conditional PUT (404), a missing key fails the precondition (RFC 9110).
-        match gb.storage.head_object(&i.bucket, &i.key, version).await {
-            Ok(m) if etag_matches(cond, &m) => {}
-            Ok(_)
-            | Err(
-                StorageError::NoSuchKey
-                | StorageError::NoSuchVersion
-                | StorageError::DeleteMarker(_),
-            ) => return Err(precondition_failed()),
-            Err(e) => return Err(storage_err(e)),
-        }
-    }
     let info = gb.require_bucket(&i.bucket).await?;
-    let d = delete_one(gb, &info, &i.key, version)
+    let bypass = i.bypass_governance_retention.unwrap_or(false);
+    let d = delete_one(gb, &info, &i.key, version, bypass, i.if_match.clone())
         .await
         .map_err(storage_err)?;
     Ok(S3Response::new(DeleteObjectOutput {
@@ -361,11 +393,12 @@ pub async fn delete_objects<S: Storage>(
         ));
     }
     let quiet = i.delete.quiet.unwrap_or(false);
+    let bypass = i.bypass_governance_retention.unwrap_or(false);
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for obj in i.delete.objects {
         let res = match version_param(obj.version_id.as_ref()) {
-            Ok(v) => delete_one(gb, &info, &obj.key, v)
+            Ok(v) => delete_one(gb, &info, &obj.key, v, bypass, None)
                 .await
                 .map_err(storage_err),
             Err(e) => Err(e),
@@ -416,14 +449,55 @@ pub(super) fn copy_source(src: &CopySource) -> S3Result<(&str, &str, Option<&str
     }
 }
 
-/// Maps an error reading a copy source; naming a delete marker is a bad request.
-pub(super) fn copy_source_err(e: StorageError, explicit: bool) -> s3s::S3Error {
+/// Makes `meta`, a copy of multipart `src`, a single-part object as AWS does: an MD5
+/// ETag and whole-object checksums (the source's algorithms plus `requested`), computed
+/// by reading the source.
+async fn single_part<S: Storage>(
+    gb: &GarbageBin<S>,
+    bucket: &str,
+    key: &str,
+    src: &ObjectMeta,
+    requested: Option<Algorithm>,
+    meta: &mut ObjectMeta,
+) -> S3Result<()> {
+    let (opened, reader) = gb
+        .storage
+        .open_object(bucket, key, Some(&src.version_id))
+        .await
+        .map_err(|e| copy_source_err(e, bucket, key, true))?;
+    if opened.etag != src.etag {
+        return Err(precondition_failed());
+    }
+    let algorithms: Vec<Algorithm> = Algorithm::ALL
+        .into_iter()
+        .filter(|a| a.get(&src.checksums).is_some())
+        .chain(requested)
+        .collect();
+    let (stream, handle) = checksum::hashing(reader.read(0..src.size), &algorithms);
+    stream
+        .try_for_each(|_| futures::future::ok(()))
+        .await
+        .map_err(|e| storage_err(StorageError::Io(e)))?;
+    let digests = handle.finish();
+    meta.etag = etag_fmt::single(&digests.md5);
+    meta.part_sizes = Vec::new();
+    meta.checksums = full_object(digests.checksums);
+    Ok(())
+}
+
+/// Maps an error reading copy source `bucket`/`key`; naming a delete marker is a bad request.
+pub(super) fn copy_source_err(
+    e: StorageError,
+    bucket: &str,
+    key: &str,
+    explicit: bool,
+) -> s3s::S3Error {
     match e {
         StorageError::DeleteMarker(_) if explicit => error(
             S3ErrorCode::InvalidRequest,
             "The source of a copy request may not specifically refer to a delete marker by version id.",
         ),
-        e => storage_err(e),
+        e => crate::errors::about(storage_err(e), bucket, key),
     }
 }
 
@@ -439,7 +513,7 @@ pub async fn copy_object<S: Storage>(
         .storage
         .head_object(src_bucket, src_key, src_version)
         .await
-        .map_err(|e| copy_source_err(e, src_version.is_some()))?;
+        .map_err(|e| copy_source_err(e, src_bucket, src_key, src_version.is_some()))?;
     check_conditions(
         &src,
         i.copy_source_if_match.as_ref(),
@@ -469,8 +543,19 @@ pub async fn copy_object<S: Storage>(
         ));
     }
 
+    // Lock settings are not copied: the destination's headers or default apply.
+    let lock_now = gb.clock.now();
+    let (retention, legal_hold) = lock::from_headers(
+        &info,
+        i.object_lock_mode.as_ref(),
+        i.object_lock_retain_until_date.as_ref(),
+        i.object_lock_legal_hold_status.as_ref(),
+        lock_now,
+    )?;
     let mut meta = src.clone();
     meta.version_id = write_version(&info);
+    meta.retention = retention.or_else(|| lock::default_retention(&info, lock_now));
+    meta.legal_hold = legal_hold;
     meta.storage_class = storage_class(i.storage_class.as_ref())?;
     meta.last_modified = now();
     meta.upload_id = None;
@@ -499,6 +584,10 @@ pub async fn copy_object<S: Storage>(
         customer_key_md5: i.sse_customer_key_md5,
         bucket_key_enabled: i.bucket_key_enabled,
     };
+    if !src.part_sizes.is_empty() {
+        let requested = algorithm(i.checksum_algorithm.as_ref()).and_then(Algorithm::parse);
+        single_part(gb, src_bucket, src_key, &src, requested, &mut meta).await?;
+    }
     gb.storage
         .copy_object(
             src_bucket,

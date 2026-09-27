@@ -24,6 +24,7 @@ The first release implements the operations real SDKs call during ordinary objec
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads | SDKs switch to multipart automatically above \~8 MB, so this is non-optional |
 | Metadata | Content-Type, Content-Encoding, Cache-Control, Content-Disposition, `x-amz-meta-*`, ETag, Last-Modified | Stored verbatim and returned on GET/HEAD; `x-amz-metadata-directive` on copy |
 | Versioning | PutBucketVersioning, GetBucketVersioning, ListObjectVersions; `versionId` on GetObject, HeadObject, DeleteObject, DeleteObjects, the object tagging operations and copy sources | `Enabled` and `Suspended` with AWS's null-version semantics; delete markers; `x-amz-version-id`, `x-amz-delete-marker` and `x-amz-copy-source-version-id` headers. MFA delete is refused (`NotImplemented`) |
+| Object Lock | PutObjectLockConfiguration, GetObjectLockConfiguration, PutObjectRetention, GetObjectRetention, PutObjectLegalHold, GetObjectLegalHold; `x-amz-bucket-object-lock-enabled` on CreateBucket; `x-amz-object-lock-mode`, `-retain-until-date` and `-legal-hold` on PutObject, CopyObject and CreateMultipartUpload, returned on GET/HEAD | GOVERNANCE and COMPLIANCE retention, legal hold, bucket default retention, `x-amz-bypass-governance-retention`. Enforced when a version is permanently deleted; delete markers and overwrites are always allowed. Retention is judged by a clock that `S3_NOW` can fix (see Container and configuration) |
 | Tagging | PutObjectTagging, GetObjectTagging, DeleteObjectTagging, PutBucketTagging, GetBucketTagging, DeleteBucketTagging | A string map on the metadata row; x-amz-tagging (URL-query-encoded) on PUT and x-amz-tagging-directive on copy. Half a day of work, no interaction with anything else |
 | Auth | SigV4 header and query (presigned URL) signing; path-style and virtual-host addressing | Lenient by default, strict verification behind a flag (see Key design decisions) |
 | Uploads | `aws-chunked` streaming bodies, `Expect: 100-continue`, `Content-MD5`, `x-amz-checksum-*` (CRC32, CRC32C, SHA1, SHA256) | These are SDK defaults, not edge cases |
@@ -37,9 +38,7 @@ Two tiers. **Deferred** features are designed for but not built until a real con
 
 **Deferred to a later release**
 
-| Deferred | What it costs | Why not now |
-| --- | --- | --- |
-| Object Lock (retention, legal hold) | Two fields on a version row, six small handlers, a check in DELETE, Compliance vs Governance and `x-amz-bypass-governance-retention`. Time-based retention needs a mockable clock (`--now` override) so tests stay deterministic | Next: it builds on versioning, whose version rows carry the lock fields. See [TODO/object-lock.md](../TODO/object-lock.md). |
+Nothing at present; planned work is tracked in [TODO/](../TODO/).
 
 **Never built**
 
@@ -86,6 +85,8 @@ A request passes through four layers in one process: the protocol crate turns HT
 
 The protocol layer and the service core never know which backend is active; the memory and fs backends pass the same conformance suite, so a test that works against one works against the other.
 
+**Error bodies.** One function renders every S3 error body, because s3s's serializer emits only `Code`, `Message` and `RequestId`. The service returns errors to s3s as usual and also leaves them in a request extension; the server renders that, adding `Key`/`BucketName` (from the request path, or from the error when it is about something else, like a copy source), `RequestId` and `HostId`. Errors s3s raises before the service runs (auth, routing, request parsing) are read back from s3s's body, since s3s offers no hook for them.
+
 ## Storage layout and write path
 
 A PUT is durable and atomic at the point the metadata row commits; before that, a crash leaves the previous object intact and at most one orphan blob to sweep.
@@ -106,7 +107,7 @@ A PUT is durable and atomic at the point the metadata row commits; before that, 
 
 1. Stream the body to `tmp/<uuid>`, computing MD5 and SHA-256 as it passes through. Decode `aws-chunked` framing and verify any `x-amz-checksum-*` trailer.
 2. `fsync` the temp file.
-3. Take the per-key lock for `bucket/key`.
+3. Take the per-key lock for `bucket/key`. A conditional write (`If-Match`, `If-None-Match`) is checked against the current version here, so two racing writers cannot both pass; it is also checked before the body is read, to fail early.
 4. `rename(tmp/<uuid>, blobs/ab/cd/<sha256>)`. If the blob already exists (same content), delete the temp file instead. Rename is the atomic step for the bytes.
 5. Add the version row `{version_id, size, etag, sha256, content_type, user_meta, last_modified}` to the key's versions under `bucket\0key` in a single redb transaction, together with the blob refcounts. Commit is the atomic step for visibility.
 6. If the write replaced a version (the null version, see below), decrement its blob's refcount; delete the blob at zero.
@@ -129,6 +130,15 @@ Every key holds a list of versions, newest first; the first is the current one, 
 - Every version with a blob holds one reference on it, so old versions pin blobs and a copy of an old version shares its bytes. The startup sweep recounts references over every version of every key.
 - Rows written before versioning (`{blob, meta}`, one per key) are read as a single null version; no migration step runs, and they are rewritten in the new format on their next write.
 
+**Object Lock**
+
+Lock state lives on rows that already exist: a bucket row carries its lock configuration (present means enabled, plus an optional default retention rule), and each version row carries its own retention (mode and retain-until instant) and legal hold. Rows without these fields load as unlocked.
+
+- CreateBucket with lock enabled also enables versioning, and a lock-enabled bucket refuses `Suspended`, so every write adds a new version and never replaces a locked one. Lock can also be enabled later on a bucket whose versioning is `Enabled`; it cannot be turned off.
+- A new version gets retention and legal hold from its request headers, else the bucket's default retention counted from its creation (for multipart, from Complete; a year is 365 days). A copy does not inherit the source's lock.
+- Every permanent removal of a version passes one check inside the backend's delete, so it is atomic with it: refused (`AccessDenied`) under a legal hold or unexpired retention, unless the retention is GOVERNANCE and the request sets `x-amz-bypass-governance-retention`. Delete markers are ordinary writes and always allowed. Retention changes are checked inside the version row update: unexpired COMPLIANCE can only be extended; unexpired GOVERNANCE only extended unless bypassed.
+- "Now" comes from one clock in the service: system time, or the instant `S3_NOW` fixes. The in-process test harness moves it to expire retention without sleeping.
+
 **Multipart**
 
 Parts land in `uploads/<id>/` as ordinary hashed temp files. Complete validates part numbers and sizes (every part but the last must be at least 5 MB), concatenates parts into a single blob with the AWS ETag formula `md5(concat(part_md5s))-N`, then follows steps 3-7. Abort deletes the directory. Uploads with no activity for 24 hours are swept on startup only; there is no background reaper.
@@ -147,15 +157,16 @@ The same trait over a `BTreeMap<(Bucket, Key), Vec<Version>>` behind an `RwLock`
 | Backend | `S3_BACKEND` | `memory` | `memory` or `fs` |
 | Data directory | `S3_DATA_DIR` | `/data` | Only read when backend is `fs`; declared as a `VOLUME` |
 | Credentials | `S3_ACCESS_KEY`, `S3_SECRET_KEY` | `test` / `test` | Used only when strict auth is on |
-| Strict auth | `S3_STRICT_AUTH` | `false` | `true` rejects requests whose SigV4 signature does not verify |
+| Strict auth | `S3_STRICT_AUTH` | `false` | `true` (or `1`, `yes`, `on`) rejects requests whose SigV4 signature does not verify |
 | Region | `S3_REGION` | `us-east-1` | Echoed in responses and used in signature verification |
 | Pre-created buckets | `S3_INIT_BUCKETS` | (none) | Comma-separated; created at startup so tests skip setup |
 | Virtual-host domain | `S3_VHOST_DOMAIN` | (none) | e.g. `localhost` makes `mybucket.localhost` resolve to `mybucket` |
 | Log level | `S3_LOG` | `info` | Structured JSON, one line per request, to stdout |
+| Object Lock clock | `S3_NOW` | (system time) | A fixed RFC 3339 instant, e.g. `2030-01-01T00:00:00Z`, that Object Lock judges retention against (expiry, default retention, "retain until must be in the future") instead of the system clock, so retention tests are deterministic. Last-Modified, version ids and SigV4 still use system time |
 
 **Image.** Multi-stage build: `rust:alpine` compiles a fully static `x86_64-unknown-linux-musl` binary (arm64 too); the runtime stage is `scratch` plus the binary and a CA bundle it does not need. Target: under 20 MB, cold start under 500 ms, resident memory under 30 MB idle.
 
-**Health.** `GET /health` returns `200` once the backend is open and init buckets exist; `GET /ready` is an alias. Docker `HEALTHCHECK` is baked into the image.
+**Health.** `GET /health` returns `200` once the backend is open and init buckets exist; `GET /ready` is an alias. Docker `HEALTHCHECK` is baked into the image. Only an unsigned `GET`/`HEAD` with no query (no `Authorization` header) is a health check; a signed request to the same path is HeadBucket or ListObjects, so buckets named `health` and `ready` behave as on AWS. Rejected: reserving the names (a real bucket name would fail) and answering health only while no such bucket exists (HeadBucket on a missing `health` bucket would get `200`).
 
 **Test harness integration.**
 
@@ -192,7 +203,7 @@ Most S3 fakes fail not on the happy path but on the defaults SDKs quietly turn o
 
 The definition of "correct" is "real SDKs and existing conformance suites pass"; hand-written unit tests come second.
 
-1. **Ceph `s3-tests`** (the de facto S3 conformance suite) run in CI against both backends, with a checked-in allowlist of tests that fail because they exercise out-of-scope features (Object Lock, ACLs, lifecycle). The allowlist can only shrink.
+1. **Ceph `s3-tests`** (the de facto S3 conformance suite) run in CI against both backends, with a checked-in allowlist of tests that fail because they exercise out-of-scope features (ACLs, lifecycle). The allowlist can only shrink.
 2. **MinIO `mint`** for a second opinion on multipart and listing edge cases.
 3. **SDK smoke tests**, one small program per SDK, each doing: create bucket, put small, put 20 MB (forces multipart), list with prefix and delimiter, range get, copy, presigned get, batch delete, delete bucket. SDKs covered: boto3, aws-sdk-go-v2, aws-sdk-js v3, aws-sdk-java v2, the AWS CLI, rclone.
 4. **Differential tests** that replay the same recorded request sequence against a real S3 bucket and this service and diff the responses, ignoring request ids and dates. Run nightly, not per commit.
@@ -207,4 +218,4 @@ A change that makes any SDK smoke test fail does not merge.
 - [ ] Should the memory backend enforce a configurable size cap and return `EntityTooLarge`, or let the container OOM?
 - [ ] Is there any need for a `sleep`/latency-injection flag for testing client timeouts, or does that belong in a proxy?
 - [ ] Multipart orphan sweep on startup only, or also a `--sweep-interval` flag for long-running dev instances?
-- [x] What triggers versioning + Object Lock leaving the deferred tier: a named internal consumer, or a failing SDK smoke test? Neither: moved in scope by decision. Versioning is built; Object Lock is next
+- [x] What triggers versioning + Object Lock leaving the deferred tier: a named internal consumer, or a failing SDK smoke test? Neither: moved in scope by decision. Both are built

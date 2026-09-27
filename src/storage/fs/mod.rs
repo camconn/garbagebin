@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::{
-    BlobReader, BucketInfo, BucketUpdate, ByteStream, MetaUpdate, ObjectMeta, PartInfo, Result,
-    Storage, StorageError, Stored, UploadInfo, versions,
+    BlobReader, BucketInfo, BucketUpdate, ByteStream, DeleteCheck, MetaUpdate, ObjectMeta,
+    PartInfo, Result, Storage, StorageError, Stored, UploadInfo, WriteCheck, versions,
 };
 use locks::KeyLocks;
 
@@ -450,7 +450,11 @@ impl Tx<'_> {
 
     /// Makes `v` current, moving blob references for it and any null version it replaces.
     fn push_version(&mut self, key: &[u8], v: Version) -> Result<()> {
-        let mut list = self.versions(key)?;
+        let list = self.versions(key)?;
+        self.push_onto(key, list, v)
+    }
+
+    fn push_onto(&mut self, key: &[u8], mut list: Vec<Version>, v: Version) -> Result<()> {
         if let Some(sha) = &v.blob {
             self.incref(sha)?;
         }
@@ -458,6 +462,13 @@ impl Tx<'_> {
             self.decref(&sha)?;
         }
         self.save_versions(key, &list)
+    }
+
+    /// The key's versions, once `check` passes on the current one.
+    fn checked_versions(&self, key: &[u8], check: WriteCheck) -> Result<Vec<Version>> {
+        let list = self.versions(key)?;
+        check(versions::live(&list).map(|v| &v.meta))?;
+        Ok(list)
     }
 
     fn upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<UploadRow> {
@@ -702,12 +713,13 @@ impl Storage for FsStorage {
         Ok(blob)
     }
 
-    async fn put_object(
+    async fn put_object_if(
         &self,
         bucket: &str,
         key: &str,
         mut blob: FsBlob,
         meta: ObjectMeta,
+        check: WriteCheck,
     ) -> Result<()> {
         let _lock = self.lock(bucket, key).await;
         let bucket = bucket.to_owned();
@@ -715,22 +727,30 @@ impl Storage for FsStorage {
         self.run(move |i| {
             i.write(|tx| {
                 tx.require_bucket(&bucket)?;
+                let list = tx.checked_versions(&ok, check)?;
                 tx.install_blob(&mut blob)?;
                 let blob = Some(blob.sha256.clone());
-                tx.push_version(&ok, Stored { meta, blob })
+                tx.push_onto(&ok, list, Stored { meta, blob })
             })
         })
         .await
     }
 
-    async fn put_delete_marker(&self, bucket: &str, key: &str, meta: ObjectMeta) -> Result<()> {
+    async fn put_delete_marker_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        meta: ObjectMeta,
+        check: WriteCheck,
+    ) -> Result<()> {
         let _lock = self.lock(bucket, key).await;
         let (bucket, ok) = (bucket.to_owned(), object_key(bucket, key));
         self.run(move |i| {
             i.write(|tx| {
                 tx.require_bucket(&bucket)?;
+                let list = tx.checked_versions(&ok, check)?;
                 let blob = None;
-                tx.push_version(&ok, Stored { meta, blob })
+                tx.push_onto(&ok, list, Stored { meta, blob })
             })
         })
         .await
@@ -781,11 +801,12 @@ impl Storage for FsStorage {
         .await
     }
 
-    async fn delete_version(
+    async fn delete_version_if(
         &self,
         bucket: &str,
         key: &str,
         version_id: &str,
+        check: DeleteCheck,
     ) -> Result<Option<ObjectMeta>> {
         let _lock = self.lock(bucket, key).await;
         let (bucket, ok) = (bucket.to_owned(), object_key(bucket, key));
@@ -794,7 +815,7 @@ impl Storage for FsStorage {
             i.write(|tx| {
                 tx.require_bucket(&bucket)?;
                 let mut list = tx.versions(&ok)?;
-                let Some(old) = versions::remove(&mut list, &version_id) else {
+                let Some(old) = versions::remove_if(&mut list, &version_id, check)? else {
                     return Ok(None);
                 };
                 if let Some(sha) = &old.blob {
@@ -906,6 +927,18 @@ impl Storage for FsStorage {
         .await
     }
 
+    async fn get_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<UploadInfo> {
+        let (bucket, key, upload_id) = (bucket.to_owned(), key.to_owned(), upload_id.to_owned());
+        self.run(move |i| {
+            i.read(|txn| {
+                bucket_info(&txn.open_table(BUCKETS)?, &bucket)?;
+                let up = upload_row(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
+                Ok(up.info)
+            })
+        })
+        .await
+    }
+
     async fn put_part(
         &self,
         bucket: &str,
@@ -980,13 +1013,14 @@ impl Storage for FsStorage {
         .await
     }
 
-    async fn complete_upload(
+    async fn complete_upload_if(
         &self,
         bucket: &str,
         key: &str,
         upload_id: &str,
         parts: &[PartInfo],
         meta: ObjectMeta,
+        check: WriteCheck,
     ) -> Result<()> {
         // Held throughout, so parts cannot be replaced or aborted mid-concatenation.
         let _lock = self.lock(bucket, key).await;
@@ -1016,9 +1050,11 @@ impl Storage for FsStorage {
             i.write(|tx| {
                 tx.require_bucket(&bucket)?;
                 let up = tx.upload(&bucket, &key, &upload_id)?;
+                let ok = object_key(&bucket, &key);
+                let list = tx.checked_versions(&ok, check)?;
                 tx.install_blob(&mut blob)?;
                 let blob = Some(blob.sha256.clone());
-                tx.push_version(&object_key(&bucket, &key), Stored { meta, blob })?;
+                tx.push_onto(&ok, list, Stored { meta, blob })?;
                 tx.drop_upload(&bucket, &upload_id, &up.dir)
             })
         })

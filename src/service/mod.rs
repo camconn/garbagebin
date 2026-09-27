@@ -2,12 +2,14 @@
 
 mod bucket;
 mod list;
+mod lock;
 mod multipart;
 mod object;
 mod tagging;
 mod versioning;
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,12 +20,14 @@ use s3s::stream::aws_chunked_stream::AwsChunkedStreamError;
 use s3s::stream::upload_stream::UploadStreamError;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
+use crate::clock::Clock;
+use crate::errors::Captured;
 use crate::lenient;
 use crate::logic::checksum::{self, Algorithm, BodyError, Digests};
 use crate::logic::validate;
 use crate::storage::{
     BucketInfo, ByteStream, Checksums, NULL_VERSION, ObjectMeta, Storage, StorageError, Tags,
-    Versioning,
+    Versioning, WriteCheck,
 };
 
 pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
@@ -31,13 +35,16 @@ pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 pub struct GarbageBin<S> {
     storage: S,
     region: String,
+    /// Object Lock's notion of now; other timestamps use system time.
+    clock: Arc<Clock>,
 }
 
 impl<S: Storage> GarbageBin<S> {
-    pub fn new(storage: S, region: impl Into<String>) -> Self {
+    pub fn new(storage: S, region: impl Into<String>, clock: Arc<Clock>) -> Self {
         Self {
             storage,
             region: region.into(),
+            clock,
         }
     }
 
@@ -248,6 +255,10 @@ pub(crate) fn storage_err(e: StorageError) -> S3Error {
         StorageError::InvalidPart => invalid_part(),
         StorageError::PreconditionFailed => precondition_failed(),
         StorageError::Body(e) => body_err(e),
+        StorageError::Refused(e) => match e.downcast::<S3Error>() {
+            Ok(e) => *e,
+            Err(e) => error(C::InternalError, e.to_string()),
+        },
         StorageError::Io(e) => S3Error::with_source(C::InternalError, Box::new(e)),
         StorageError::Internal(msg) => error(C::InternalError, msg),
     }
@@ -415,24 +426,14 @@ fn check_conditions(
     Ok(())
 }
 
-/// Conditional write (PutObject, CompleteMultipartUpload): `If-None-Match` blocks
-/// when the key exists with a matching ETag; `If-Match` requires one.
-async fn check_write_conditions<S: Storage>(
-    gb: &GarbageBin<S>,
-    bucket: &str,
-    key: &str,
+/// Conditional write (PutObject, CompleteMultipartUpload) against the key's current
+/// version: `If-None-Match` fails on a matching ETag; `If-Match` requires one (404 if absent).
+fn write_condition(
+    existing: Option<&ObjectMeta>,
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,
 ) -> S3Result<()> {
-    if if_match.is_none() && if_none_match.is_none() {
-        return Ok(());
-    }
-    let existing = match gb.storage.head_object(bucket, key, None).await {
-        Ok(m) => Some(m),
-        Err(StorageError::NoSuchKey | StorageError::DeleteMarker(_)) => None,
-        Err(e) => return Err(storage_err(e)),
-    };
-    let blocked = match (if_none_match, if_match, &existing) {
+    let blocked = match (if_none_match, if_match, existing) {
         (Some(c), _, Some(m)) if etag_matches(c, m) => true,
         (_, Some(_), None) => return Err(storage_err(StorageError::NoSuchKey)),
         (_, Some(c), Some(m)) => !etag_matches(c, m),
@@ -444,23 +445,52 @@ async fn check_write_conditions<S: Storage>(
     Ok(())
 }
 
+/// Checks a conditional write now, so it fails before a body is read, and returns
+/// the check for the backend to repeat atomically with the commit.
+async fn check_write_conditions<S: Storage>(
+    gb: &GarbageBin<S>,
+    bucket: &str,
+    key: &str,
+    if_match: Option<ETagCondition>,
+    if_none_match: Option<ETagCondition>,
+) -> S3Result<WriteCheck> {
+    if if_match.is_none() && if_none_match.is_none() {
+        return Ok(Box::new(|_| Ok(())));
+    }
+    let existing = match gb.storage.head_object(bucket, key, None).await {
+        Ok(m) => Some(m),
+        Err(StorageError::NoSuchKey | StorageError::DeleteMarker(_)) => None,
+        Err(e) => return Err(storage_err(e)),
+    };
+    write_condition(existing.as_ref(), if_match.as_ref(), if_none_match.as_ref())?;
+    Ok(Box::new(move |m| {
+        write_condition(m, if_match.as_ref(), if_none_match.as_ref()).map_err(lock::refused)
+    }))
+}
+
 /// Parses an `x-amz-tagging` header (URL query encoded).
 fn parse_tagging_header(header: Option<&str>) -> S3Result<Tags> {
     let tags: Tags = header
         .map(|h| form_urlencoded::parse(h.as_bytes()).into_owned().collect())
         .unwrap_or_default();
-    validate_tags(tags.iter())?;
+    validate_tags(&tags, TagTarget::Object)?;
     Ok(tags)
 }
 
-fn validate_tags<'a>(
-    tags: impl ExactSizeIterator<Item = (&'a String, &'a String)>,
-) -> S3Result<()> {
-    if tags.len() > 10 {
-        return Err(error(
-            S3ErrorCode::InvalidTag,
-            "Object tags cannot be greater than 10",
-        ));
+#[derive(Clone, Copy)]
+enum TagTarget {
+    Object,
+    Bucket,
+}
+
+fn validate_tags(tags: &Tags, target: TagTarget) -> S3Result<()> {
+    let too_many = match target {
+        TagTarget::Object if tags.len() > 10 => Some("Object tags cannot be greater than 10"),
+        TagTarget::Bucket if tags.len() > 50 => Some("Bucket tag count cannot be greater than 50"),
+        _ => None,
+    };
+    if let Some(msg) = too_many {
+        return Err(error(S3ErrorCode::InvalidTag, msg));
     }
     for (k, v) in tags {
         if k.is_empty() || k.chars().count() > 128 || v.chars().count() > 256 {
@@ -530,7 +560,12 @@ macro_rules! delegate {
         impl<S: Storage> S3 for GarbageBin<S> {
             $(
                 async fn $op(&self, req: S3Request<s3s::dto::$input>) -> S3Result<S3Response<s3s::dto::$output>> {
-                    $module::$op(self, req).await
+                    let captured = req.extensions.get::<Captured>().cloned();
+                    let res = $module::$op(self, req).await;
+                    if let (Err(e), Some(c)) = (&res, captured) {
+                        c.set(e);
+                    }
+                    res
                 }
             )*
         }
@@ -567,4 +602,10 @@ delegate! {
     put_bucket_versioning: PutBucketVersioningInput => PutBucketVersioningOutput, via versioning;
     get_bucket_versioning: GetBucketVersioningInput => GetBucketVersioningOutput, via versioning;
     list_object_versions: ListObjectVersionsInput => ListObjectVersionsOutput, via versioning;
+    put_object_lock_configuration: PutObjectLockConfigurationInput => PutObjectLockConfigurationOutput, via lock;
+    get_object_lock_configuration: GetObjectLockConfigurationInput => GetObjectLockConfigurationOutput, via lock;
+    put_object_retention: PutObjectRetentionInput => PutObjectRetentionOutput, via lock;
+    get_object_retention: GetObjectRetentionInput => GetObjectRetentionOutput, via lock;
+    put_object_legal_hold: PutObjectLegalHoldInput => PutObjectLegalHoldOutput, via lock;
+    get_object_legal_hold: GetObjectLegalHoldInput => GetObjectLegalHoldOutput, via lock;
 }

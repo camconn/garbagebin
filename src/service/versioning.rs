@@ -6,6 +6,7 @@ use s3s::dto::{
 use s3s::{S3ErrorCode, S3Request, S3Response, S3Result};
 
 use super::list::{Enc, max_keys};
+use super::lock::refused;
 use super::{GarbageBin, error, etag, invalid_argument, owner, storage_err, ts};
 use crate::logic::listing::{self, VersionEntry};
 use crate::storage::{BucketInfo, Storage, Versioning};
@@ -37,6 +38,12 @@ pub async fn put_bucket_versioning<S: Storage>(
         }
     };
     let f = Box::new(move |b: &mut BucketInfo| {
+        if b.object_lock.is_some() && status == Versioning::Suspended {
+            return Err(refused(error(
+                S3ErrorCode::InvalidBucketState,
+                "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
+            )));
+        }
         b.versioning = Some(status);
         Ok(())
     });

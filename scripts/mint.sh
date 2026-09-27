@@ -54,10 +54,6 @@ EXCLUDE=(
   # Asserts MinIO's ListMultipartUploads (no Owner/Initiator/StorageClass; key-marker without
   # upload-id-marker includes the marker key), which differs from AWS.
   minio-go:testListMultipartUpload
-  # Object Lock (deferred, docs/design.md).
-  minio-go:testRemoveMultipleObjectsWithResult versioning:testLockingLegalhold
-  versioning:testPutGetRetentionCompliance versioning:testPutGetDeleteRetentionGovernance
-  versioning:testLockingRetentionGovernance versioning:testLockingRetentionCompliance
   # Browser POST uploads (PostObject) are not an in-scope operation.
   minio-go:testPresignedPostPolicy minio-go:testPresignedPostPolicyWrongFile
   # Per-part checksums on GET partNumber are not kept (TODO/s3-api-gaps.md).

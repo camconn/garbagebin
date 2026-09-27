@@ -18,8 +18,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 
 use super::{
-    ByteStream, Checksums, NULL_VERSION, ObjectMeta, PartInfo, Sse, Storage, StorageError, Tags,
-    UploadInfo,
+    BucketInfo, ByteStream, Checksums, LockMode, NULL_VERSION, ObjectLock, ObjectMeta, PartInfo,
+    Retention, RetentionPeriod, Sse, Storage, StorageError, Tags, UploadInfo,
 };
 
 #[macro_export]
@@ -29,7 +29,7 @@ macro_rules! storage_conformance {
             buckets, bucket_tags, missing_bucket, put_get_head, meta_round_trip, overwrite,
             ranges, delete, body_error, copy, object_tags, listing, multipart,
             multipart_errors, concurrent_writes, versions, delete_markers, version_copy_and_tags,
-            version_listing);
+            version_listing, lock_fields, write_checks, get_upload);
     };
     (@tests $make:expr; $($name:ident),*) => {
         $(
@@ -313,6 +313,11 @@ pub async fn meta_round_trip<S: Storage>(s: S) {
             bucket_key_enabled: Some(true),
         },
         storage_class: Some("STANDARD_IA".into()),
+        retention: Some(Retention {
+            mode: LockMode::Compliance,
+            until: SystemTime::UNIX_EPOCH + Duration::from_secs(1_900_000_000),
+        }),
+        legal_hold: Some(false),
     };
     let blob = s.write_blob(stream(&[b"abc"])).await.unwrap();
     s.put_object("b", "k", blob, meta.clone()).await.unwrap();
@@ -594,6 +599,124 @@ pub async fn multipart_errors<S: Storage>(s: S) {
     );
 }
 
+/// A check that records what it saw and refuses unless `allow`.
+fn recording_check(
+    seen: &Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    allow: bool,
+) -> super::WriteCheck {
+    let seen = Arc::clone(seen);
+    Box::new(move |m| {
+        seen.lock().unwrap().push(m.map(|m| m.etag.clone()));
+        if allow {
+            Ok(())
+        } else {
+            Err(StorageError::PreconditionFailed)
+        }
+    })
+}
+
+pub async fn write_checks<S: Storage>(s: S) {
+    s.create_bucket("b").await.unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let meta = |etag: &str| ObjectMeta::new(1, etag.to_owned());
+
+    // A refused put, delete marker or complete changes nothing.
+    let blob = s.write_blob(stream(&[b"x"])).await.unwrap();
+    assert_err!(
+        s.put_object_if("b", "k", blob, meta("e1"), recording_check(&seen, false))
+            .await,
+        StorageError::PreconditionFailed
+    );
+    assert_err!(s.head_object("b", "k", None).await, StorageError::NoSuchKey);
+    let blob = s.write_blob(stream(&[b"x"])).await.unwrap();
+    s.put_object_if("b", "k", blob, meta("e1"), recording_check(&seen, true))
+        .await
+        .unwrap();
+    let mut dm = ObjectMeta::delete_marker("dm".into());
+    dm.last_modified = SystemTime::now();
+    assert_err!(
+        s.put_delete_marker_if("b", "k", dm.clone(), recording_check(&seen, false))
+            .await,
+        StorageError::PreconditionFailed
+    );
+    assert_eq!(s.head_object("b", "k", None).await.unwrap().etag, "e1");
+    s.put_delete_marker_if("b", "k", dm, recording_check(&seen, true))
+        .await
+        .unwrap();
+
+    s.create_upload("b", upload("u", "k")).await.unwrap();
+    let blob = s.write_blob(stream(&[b"x"])).await.unwrap();
+    s.put_part("b", "k", "u", part(1, b"x"), blob)
+        .await
+        .unwrap();
+    let parts = [part(1, b"x")];
+    assert_err!(
+        s.complete_upload_if(
+            "b",
+            "k",
+            "u",
+            &parts,
+            meta("e2"),
+            recording_check(&seen, false)
+        )
+        .await,
+        StorageError::PreconditionFailed
+    );
+    s.get_upload("b", "k", "u").await.unwrap();
+    s.complete_upload_if(
+        "b",
+        "k",
+        "u",
+        &parts,
+        meta("e2"),
+        recording_check(&seen, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.head_object("b", "k", None).await.unwrap().etag, "e2");
+
+    // Checks see the current version; a delete marker counts as none.
+    let e1 = Some("e1".to_owned());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [None, None, e1.clone(), e1, None, None]
+    );
+}
+
+pub async fn get_upload<S: Storage>(s: S) {
+    s.create_bucket("b").await.unwrap();
+    s.create_upload("b", upload("u", "k")).await.unwrap();
+    let blob = s.write_blob(stream(&[b"x"])).await.unwrap();
+    s.put_part("b", "k", "u", part(1, b"x"), blob)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_upload("b", "k", "u").await.unwrap(),
+        upload_info(&s).await
+    );
+    assert_err!(
+        s.get_upload("b", "other", "u").await,
+        StorageError::NoSuchUpload
+    );
+    assert_err!(
+        s.get_upload("b", "k", "nope").await,
+        StorageError::NoSuchUpload
+    );
+    assert_err!(
+        s.get_upload("nob", "k", "u").await,
+        StorageError::NoSuchBucket
+    );
+    s.abort_upload("b", "k", "u").await.unwrap();
+    assert_err!(
+        s.get_upload("b", "k", "u").await,
+        StorageError::NoSuchUpload
+    );
+}
+
+async fn upload_info<S: Storage>(s: &S) -> UploadInfo {
+    s.list_parts("b", "k", "u").await.unwrap().0
+}
+
 pub async fn concurrent_writes<S: Storage>(s: S) {
     let s = Arc::new(s);
     s.create_bucket("b").await.unwrap();
@@ -788,6 +911,72 @@ pub async fn version_listing<S: Storage>(s: S) {
         keys(&s, "b", "", Some("a/b"), 1).await,
         Vec::<String>::new()
     );
+}
+
+/// Lock config on the bucket row, and closures that refuse change nothing.
+pub async fn lock_fields<S: Storage>(s: S) {
+    let refuse = || StorageError::Refused("locked".into());
+    s.create_bucket("b").await.unwrap();
+    assert_eq!(s.head_bucket("b").await.unwrap().object_lock, None);
+    let lock = ObjectLock {
+        default_retention: Some((LockMode::Governance, RetentionPeriod::Years(2))),
+    };
+    let f = Box::new(move |b: &mut BucketInfo| {
+        b.object_lock = Some(lock);
+        Ok(())
+    });
+    s.update_bucket("b", f).await.unwrap();
+    assert_eq!(s.head_bucket("b").await.unwrap().object_lock, Some(lock));
+    let f = Box::new(move |b: &mut BucketInfo| {
+        b.object_lock = None;
+        Err(refuse())
+    });
+    assert_err!(s.update_bucket("b", f).await, StorageError::Refused(_));
+    assert_eq!(s.head_bucket("b").await.unwrap().object_lock, Some(lock));
+
+    let v1 = put_version(&s, "k", "v1", b"one").await;
+    let f = Box::new(move |m: &mut ObjectMeta| {
+        m.legal_hold = Some(true);
+        Ok(())
+    });
+    let held = s.update_object("b", "k", Some("v1"), f).await.unwrap();
+    assert_eq!(held.legal_hold, Some(true));
+    let f = Box::new(move |m: &mut ObjectMeta| {
+        m.legal_hold = None;
+        Err(refuse())
+    });
+    assert_err!(
+        s.update_object("b", "k", Some("v1"), f).await,
+        StorageError::Refused(_)
+    );
+    assert_eq!(s.head_object("b", "k", None).await.unwrap(), held);
+
+    // The check sees the version (delete markers included) and can veto its removal.
+    s.put_delete_marker("b", "k", ObjectMeta::delete_marker("dm".into()))
+        .await
+        .unwrap();
+    let held_only = || -> super::DeleteCheck {
+        Box::new(|m| match m.legal_hold {
+            Some(true) => Err(StorageError::Refused("held".into())),
+            _ => Ok(()),
+        })
+    };
+    assert_err!(
+        s.delete_version_if("b", "k", "v1", held_only()).await,
+        StorageError::Refused(_)
+    );
+    assert_eq!(read_version(&s, "k", Some("v1")).await, b"one");
+    let gone = s.delete_version_if("b", "k", "dm", held_only()).await;
+    assert!(gone.unwrap().unwrap().delete_marker);
+    assert!(
+        s.delete_version_if("b", "k", "nope", held_only())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(s.head_object("b", "k", None).await.unwrap().etag, v1.etag);
+    s.delete_version("b", "k", "v1").await.unwrap();
+    s.delete_bucket("b").await.unwrap();
 }
 
 impl PartInfo {

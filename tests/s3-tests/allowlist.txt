@@ -17,11 +17,6 @@ test_bucket_list_return_data
 test_bucket_list_return_data_versioning
 test_list_multipart_upload_owner
 
-# Object Lock (deferred, TODO/object-lock.md)
-*object_lock*
-*retention*
-*legal_hold*
-
 # Lifecycle, storage classes, restore
 *lifecycle*
 *expiration*

@@ -10,8 +10,8 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 
 use super::{
-    BlobReader, BucketInfo, BucketUpdate, ByteStream, MetaUpdate, ObjectMeta, PartInfo, Result,
-    Storage, StorageError, Stored, UploadInfo, versions,
+    BlobReader, BucketInfo, BucketUpdate, ByteStream, DeleteCheck, MetaUpdate, ObjectMeta,
+    PartInfo, Result, Storage, StorageError, Stored, UploadInfo, WriteCheck, versions,
 };
 
 #[derive(Default)]
@@ -59,8 +59,11 @@ impl Bucket {
         self.objects.get(key).map_or(&[], Vec::as_slice)
     }
 
-    fn push(&mut self, key: &str, v: Version) {
+    /// Makes `v` current once `check` passes on the current version.
+    fn push(&mut self, key: &str, v: Version, check: WriteCheck) -> Result<()> {
+        check(versions::live(self.versions(key)).map(|v| &v.meta))?;
         versions::push(self.objects.entry(key.to_owned()).or_default(), v);
+        Ok(())
     }
 
     fn range<'a>(
@@ -154,24 +157,29 @@ impl Storage for MemoryStorage {
         Ok(buf.freeze())
     }
 
-    async fn put_object(
+    async fn put_object_if(
         &self,
         bucket: &str,
         key: &str,
         body: Bytes,
         meta: ObjectMeta,
+        check: WriteCheck,
     ) -> Result<()> {
         let mut map = self.write();
         let blob = Some(body);
-        bucket_mut(&mut map, bucket)?.push(key, Stored { meta, blob });
-        Ok(())
+        bucket_mut(&mut map, bucket)?.push(key, Stored { meta, blob }, check)
     }
 
-    async fn put_delete_marker(&self, bucket: &str, key: &str, meta: ObjectMeta) -> Result<()> {
+    async fn put_delete_marker_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        meta: ObjectMeta,
+        check: WriteCheck,
+    ) -> Result<()> {
         let mut map = self.write();
         let blob = None;
-        bucket_mut(&mut map, bucket)?.push(key, Stored { meta, blob });
-        Ok(())
+        bucket_mut(&mut map, bucket)?.push(key, Stored { meta, blob }, check)
     }
 
     async fn head_object(
@@ -198,18 +206,19 @@ impl Storage for MemoryStorage {
         Ok((v.meta.clone(), Box::new(MemoryReader(body))))
     }
 
-    async fn delete_version(
+    async fn delete_version_if(
         &self,
         bucket: &str,
         key: &str,
         version_id: &str,
+        check: DeleteCheck,
     ) -> Result<Option<ObjectMeta>> {
         let mut map = self.write();
         let b = bucket_mut(&mut map, bucket)?;
         let Some(list) = b.objects.get_mut(key) else {
             return Ok(None);
         };
-        let removed = versions::remove(list, version_id);
+        let removed = versions::remove_if(list, version_id, check)?;
         if list.is_empty() {
             b.objects.remove(key);
         }
@@ -232,8 +241,7 @@ impl Storage for MemoryStorage {
             return Err(StorageError::PreconditionFailed);
         }
         let blob = src.blob.clone();
-        bucket_mut(&mut map, dst_bucket)?.push(dst_key, Stored { meta, blob });
-        Ok(())
+        bucket_mut(&mut map, dst_bucket)?.push(dst_key, Stored { meta, blob }, super::no_check())
     }
 
     async fn update_object(
@@ -293,6 +301,19 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    async fn get_upload(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<UploadInfo> {
+        let map = self.read();
+        Ok(bucket(&map, bucket_name)?
+            .upload(key, upload_id)?
+            .info
+            .clone())
+    }
+
     async fn put_part(
         &self,
         bucket: &str,
@@ -330,13 +351,14 @@ impl Storage for MemoryStorage {
         Ok(uploads)
     }
 
-    async fn complete_upload(
+    async fn complete_upload_if(
         &self,
         bucket: &str,
         key: &str,
         upload_id: &str,
         parts: &[PartInfo],
         meta: ObjectMeta,
+        check: WriteCheck,
     ) -> Result<()> {
         let mut map = self.write();
         let b = bucket_mut(&mut map, bucket)?;
@@ -348,9 +370,9 @@ impl Storage for MemoryStorage {
                 _ => return Err(StorageError::InvalidPart),
             }
         }
-        b.uploads.remove(upload_id);
         let blob = Some(body.freeze());
-        b.push(key, Stored { meta, blob });
+        b.push(key, Stored { meta, blob }, check)?;
+        b.uploads.remove(upload_id);
         Ok(())
     }
 

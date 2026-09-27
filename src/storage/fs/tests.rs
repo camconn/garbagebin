@@ -6,7 +6,7 @@ use futures::StreamExt;
 use redb::ReadableTable;
 
 use super::sweep::UPLOAD_TTL;
-use super::{FsStorage, OBJECTS, REFS, object_key};
+use super::{BUCKETS, FsStorage, OBJECTS, REFS, object_key};
 use crate::storage::{
     ByteStream, Checksums, NULL_VERSION, ObjectMeta, PartInfo, Storage, UploadInfo,
 };
@@ -320,8 +320,19 @@ async fn loads_rows_from_before_versioning() {
             let meta = v["meta"].as_object_mut().unwrap();
             meta.remove("version_id");
             meta.remove("delete_marker");
+            meta.remove("retention");
+            meta.remove("legal_hold");
             let legacy = serde_json::to_vec(&v).unwrap();
             t.insert(ok.as_slice(), legacy.as_slice()).unwrap();
+            // And the bucket row without versioning or Object Lock.
+            let mut t = txn.open_table(BUCKETS).unwrap();
+            let mut row: serde_json::Value =
+                serde_json::from_slice(t.get("b").unwrap().unwrap().value()).unwrap();
+            let row_map = row.as_object_mut().unwrap();
+            row_map.remove("versioning");
+            row_map.remove("object_lock");
+            let legacy = serde_json::to_vec(&row).unwrap();
+            t.insert("b", legacy.as_slice()).unwrap();
         }
         txn.commit().unwrap();
     }
@@ -329,6 +340,9 @@ async fn loads_rows_from_before_versioning() {
     assert_eq!(get(&s, "k").await, b"old");
     let meta = s.head_object("b", "k", None).await.unwrap();
     assert_eq!(meta.version_id, NULL_VERSION);
+    assert_eq!((meta.retention, meta.legal_hold), (None, None));
+    let info = s.head_bucket("b").await.unwrap();
+    assert_eq!((info.versioning, info.object_lock), (None, None));
     let blob = s.write_blob(stream(b"new")).await.unwrap();
     let mut meta = ObjectMeta::new(3, "3".into());
     meta.version_id = "v1".into();

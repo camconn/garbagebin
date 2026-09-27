@@ -1809,7 +1809,7 @@ async fn part_number_reads(b: Backend) {
         .unwrap_err();
     assert_eq!(status(&e), 416);
 
-    // Survives a copy.
+    // A copy is a single-part object.
     c.copy_object()
         .bucket("bkt")
         .key("mp-copy")
@@ -1817,15 +1817,24 @@ async fn part_number_reads(b: Backend) {
         .send()
         .await
         .unwrap();
-    let head = c
+    let e = c
         .head_object()
         .bucket("bkt")
         .key("mp-copy")
         .part_number(3)
         .send()
         .await
+        .unwrap_err();
+    assert_eq!(status(&e), 416);
+    let head = c
+        .head_object()
+        .bucket("bkt")
+        .key("mp-copy")
+        .part_number(1)
+        .send()
+        .await
         .unwrap();
-    assert_eq!(head.content_length(), Some(100));
+    assert_eq!(head.parts_count(), None);
 }
 
 /// Rewrites a checksum header after signing, as a corrupting proxy would.
@@ -2580,6 +2589,271 @@ async fn composite_checksum_without_part_count(b: Backend) {
     }
 }
 
+/// Outcomes of concurrent requests: successes, and the statuses of failures.
+fn tally<T, E>(
+    results: Vec<Result<T, aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>>>,
+) -> (usize, Vec<u16>) {
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let failed = results
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .map(status)
+        .collect();
+    (ok, failed)
+}
+
+async fn concurrent_conditional_writes(b: Backend) {
+    const N: usize = 12;
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let put = |i: usize, m: Option<String>, n: Option<&str>| {
+        c.put_object()
+            .bucket("bkt")
+            .key("k")
+            .body(ByteStream::from(vec![i as u8; 256 * 1024]))
+            .set_if_match(m)
+            .set_if_none_match(n.map(str::to_owned))
+            .send()
+    };
+    let (ok, failed) =
+        tally(futures::future::join_all((0..N).map(|i| put(i, None, Some("*")))).await);
+    assert_eq!((ok, failed), (1, vec![412; N - 1]));
+
+    // Every writer holds the same, soon stale, ETag.
+    let etag = |c: aws_sdk_s3::Client| async move {
+        let h = c.head_object().bucket("bkt").key("k").send().await.unwrap();
+        h.e_tag().unwrap().to_owned()
+    };
+    let first = etag(c.clone()).await;
+    let results =
+        futures::future::join_all((N..2 * N).map(|i| put(i, Some(first.clone()), None))).await;
+    assert_eq!(tally(results), (1, vec![412; N - 1]));
+
+    let current = etag(c.clone()).await;
+    let deletes = (0..N).map(|_| {
+        c.delete_object()
+            .bucket("bkt")
+            .key("k")
+            .if_match(&current)
+            .send()
+    });
+    assert_eq!(
+        tally(futures::future::join_all(deletes).await),
+        (1, vec![412; N - 1])
+    );
+
+    // Completing uploads onto a missing key: only the first creates it.
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let id = new_upload(&c, "m").await;
+        let part = put_part(&c, "m", &id, 1, b"abc".to_vec()).await;
+        ids.push((id, part));
+    }
+    let completes = ids.into_iter().map(|(id, part)| {
+        c.complete_multipart_upload()
+            .bucket("bkt")
+            .key("m")
+            .upload_id(id)
+            .if_none_match("*")
+            .multipart_upload(CompletedMultipartUpload::builder().parts(part).build())
+            .send()
+    });
+    assert_eq!(
+        tally(futures::future::join_all(completes).await),
+        (1, vec![412; 3])
+    );
+}
+
+async fn tag_limits(b: Backend) {
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    c.put_object()
+        .bucket("bkt")
+        .key("k")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let tagging = |n: usize| {
+        let tags = (0..n)
+            .map(|i| {
+                Tag::builder()
+                    .key(format!("k{i}"))
+                    .value("v")
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        Tagging::builder().set_tag_set(Some(tags)).build().unwrap()
+    };
+    let put_bucket = |n| {
+        c.put_bucket_tagging()
+            .bucket("bkt")
+            .tagging(tagging(n))
+            .send()
+    };
+    put_bucket(50).await.unwrap();
+    let e = put_bucket(51).await.unwrap_err();
+    assert_eq!(code(&e), "InvalidTag");
+    let got = c.get_bucket_tagging().bucket("bkt").send().await.unwrap();
+    assert_eq!(got.tag_set().len(), 50);
+
+    let put_object = |n| {
+        c.put_object_tagging()
+            .bucket("bkt")
+            .key("k")
+            .tagging(tagging(n))
+            .send()
+    };
+    put_object(10).await.unwrap();
+    let e = put_object(11).await.unwrap_err();
+    assert_eq!(code(&e), "InvalidTag");
+}
+
+async fn health_names_are_buckets_too(b: Backend) {
+    let s = start(b).await;
+    let c = s.client();
+    // Signed requests are S3, so a missing bucket is missing.
+    for name in ["health", "ready"] {
+        let e = c.head_bucket().bucket(name).send().await.unwrap_err();
+        assert_eq!(status(&e), 404, "{name}");
+        c.create_bucket().bucket(name).send().await.unwrap();
+        c.head_bucket().bucket(name).send().await.unwrap();
+        c.put_object()
+            .bucket(name)
+            .key("k")
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+        let listed = c.list_objects_v2().bucket(name).send().await.unwrap();
+        assert_eq!(listed.contents()[0].key(), Some("k"));
+        // Unsigned probes still get the health check.
+        let r = s.raw_get(&format!("/{name}")).await;
+        assert_eq!((r.status.as_u16(), r.text().as_str()), (200, "ok\n"));
+    }
+}
+
+async fn copy_of_multipart_is_single_part(b: Backend) {
+    use aws_sdk_s3::types::ChecksumType;
+    use garbagebin::logic::checksum::Algorithm;
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let data: Vec<u8> = (0..5 * MIB + 100).map(|i| (i % 251) as u8).collect();
+    let id = c
+        .create_multipart_upload()
+        .bucket("bkt")
+        .key("src")
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .send()
+        .await
+        .unwrap()
+        .upload_id()
+        .unwrap()
+        .to_owned();
+    let mut parts = Vec::new();
+    for (n, chunk) in [(1, &data[..5 * MIB]), (2, &data[5 * MIB..])] {
+        let out = c
+            .upload_part()
+            .bucket("bkt")
+            .key("src")
+            .upload_id(&id)
+            .part_number(n)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .body(ByteStream::from(chunk.to_vec()))
+            .send()
+            .await
+            .unwrap();
+        parts.push(
+            CompletedPart::builder()
+                .part_number(n)
+                .e_tag(out.e_tag().unwrap())
+                .set_checksum_crc32(out.checksum_crc32().map(str::to_owned))
+                .build(),
+        );
+    }
+    complete(&c, "src", &id, parts).await.unwrap();
+
+    let out = c
+        .copy_object()
+        .bucket("bkt")
+        .key("dst")
+        .copy_source("bkt/src")
+        .send()
+        .await
+        .unwrap();
+    let want_etag = format!("\"{}\"", md5_hex(&data));
+    assert_eq!(
+        out.copy_object_result().unwrap().e_tag(),
+        Some(want_etag.as_str())
+    );
+    let head = c
+        .head_object()
+        .bucket("bkt")
+        .key("dst")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.e_tag(), Some(want_etag.as_str()));
+    assert_eq!(head.parts_count(), None);
+    assert_eq!(
+        head.checksum_crc32(),
+        Some(Algorithm::Crc32.digest(&data).as_str())
+    );
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+    let e = c
+        .get_object()
+        .bucket("bkt")
+        .key("dst")
+        .part_number(2)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), "InvalidPartNumber");
+    let got = c
+        .get_object()
+        .bucket("bkt")
+        .key("dst")
+        .part_number(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body(got).await, data);
+}
+
+async fn copy_errors_name_the_source(b: Backend) {
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let id = new_upload(&c, "dst").await;
+    let copy = |path: String, source: &str| {
+        Request::put(path)
+            .header("x-amz-copy-source", source)
+            .body(Full::default())
+            .unwrap()
+    };
+    for path in [
+        "/bkt/dst".to_owned(),
+        format!("/bkt/dst?partNumber=1&uploadId={id}"),
+    ] {
+        let r = s.raw(copy(path.clone(), "/bkt/missing%20src")).await;
+        assert_eq!(r.status, 404, "{path}: {}", r.text());
+        assert!(r.text().contains("<Code>NoSuchKey</Code>"), "{}", r.text());
+        assert!(r.text().contains("<Key>missing src</Key>"), "{}", r.text());
+        let r = s.raw(copy(path.clone(), "/nobucket/k")).await;
+        assert_eq!(r.status, 404, "{path}: {}", r.text());
+        assert!(
+            r.text().contains("<BucketName>nobucket</BucketName>"),
+            "{}",
+            r.text()
+        );
+    }
+}
+
 backend_tests!(
     create_owned_bucket,
     bucket_location,
@@ -2616,4 +2890,9 @@ backend_tests!(
     unsupported_checksum_rejected,
     conditional_delete,
     composite_checksum_without_part_count,
+    concurrent_conditional_writes,
+    tag_limits,
+    health_names_are_buckets_too,
+    copy_of_multipart_is_single_part,
+    copy_errors_name_the_source,
 );

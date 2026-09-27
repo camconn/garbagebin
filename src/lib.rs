@@ -1,6 +1,8 @@
 //! Garbage Bin: a single-node S3-compatible object store. See docs/design.md.
 
+pub mod clock;
 pub mod config;
+pub mod errors;
 pub mod healthcheck;
 pub mod lenient;
 pub mod logic;

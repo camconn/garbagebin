@@ -12,7 +12,7 @@ use super::object::{copy_source, copy_source_err};
 use super::{
     DEFAULT_CONTENT_TYPE, GarbageBin, Trailers, Upload, algorithm, check_checksum_support,
     check_conditions, check_key, check_write_conditions, content_encoding, digest_error, error,
-    expected_checksums, invalid_argument, invalid_part, now, owner, parse_tagging_header,
+    expected_checksums, invalid_argument, invalid_part, lock, now, owner, parse_tagging_header,
     precondition_failed, storage_class, storage_err, ts, write_version, written_version,
 };
 use crate::logic::checksum::{self, Algorithm, BodyError};
@@ -68,7 +68,16 @@ pub async fn create_multipart_upload<S: Storage>(
     check_checksum_support(&req.headers)?;
     let i = req.input;
     check_key(&i.key)?;
+    let info = gb.require_bucket(&i.bucket).await?;
     let mut meta = ObjectMeta::new(0, String::new());
+    // Explicit settings only; the bucket default applies on Complete.
+    (meta.retention, meta.legal_hold) = lock::from_headers(
+        &info,
+        i.object_lock_mode.as_ref(),
+        i.object_lock_retain_until_date.as_ref(),
+        i.object_lock_legal_hold_status.as_ref(),
+        gb.clock.now(),
+    )?;
     meta.content_type = Some(
         i.content_type
             .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_owned()),
@@ -127,9 +136,9 @@ pub async fn upload_part<S: Storage>(
     let i = req.input;
     let n = part_number(i.part_number)?;
     // Fail fast on a bad upload id before reading the body.
-    let (upload, _) = gb
+    let upload = gb
         .storage
-        .list_parts(&i.bucket, &i.key, &i.upload_id)
+        .get_upload(&i.bucket, &i.key, &i.upload_id)
         .await
         .map_err(storage_err)?;
     let expected = expected_checksums(
@@ -200,16 +209,16 @@ pub async fn upload_part_copy<S: Storage>(
     let i = req.input;
     let n = part_number(i.part_number)?;
     let (src_bucket, src_key, src_version) = copy_source(&i.copy_source)?;
-    let (upload, _) = gb
+    let upload = gb
         .storage
-        .list_parts(&i.bucket, &i.key, &i.upload_id)
+        .get_upload(&i.bucket, &i.key, &i.upload_id)
         .await
         .map_err(storage_err)?;
     let (meta, reader) = gb
         .storage
         .open_object(src_bucket, src_key, src_version)
         .await
-        .map_err(|e| copy_source_err(e, src_version.is_some()))?;
+        .map_err(|e| copy_source_err(e, src_bucket, src_key, src_version.is_some()))?;
     check_conditions(
         &meta,
         i.copy_source_if_match.as_ref(),
@@ -290,14 +299,7 @@ pub async fn complete_multipart_upload<S: Storage>(
         Err(e) => return Err(storage_err(e)),
     };
     let info = gb.require_bucket(&i.bucket).await?;
-    check_write_conditions(
-        gb,
-        &i.bucket,
-        &i.key,
-        i.if_match.as_ref(),
-        i.if_none_match.as_ref(),
-    )
-    .await?;
+    let check = check_write_conditions(gb, &i.bucket, &i.key, i.if_match, i.if_none_match).await?;
     let mut sent: Vec<CompletedPart> = i.multipart_upload.and_then(|m| m.parts).unwrap_or_default();
     // A part number listed twice in a row names the same part; the later entry wins.
     sent.dedup_by(|later, earlier| {
@@ -344,6 +346,9 @@ pub async fn complete_multipart_upload<S: Storage>(
     meta.last_modified = now();
     meta.part_sizes = chosen.iter().map(|p| p.size).collect();
     meta.upload_id = Some(i.upload_id.clone());
+    meta.retention = meta
+        .retention
+        .or_else(|| lock::default_retention(&info, gb.clock.now()));
     meta.checksums = Checksums::default();
     if let Some(a) = upload
         .checksum_algorithm
@@ -377,7 +382,14 @@ pub async fn complete_multipart_upload<S: Storage>(
         }
     }
     gb.storage
-        .complete_upload(&i.bucket, &i.key, &i.upload_id, &chosen, meta.clone())
+        .complete_upload_if(
+            &i.bucket,
+            &i.key,
+            &i.upload_id,
+            &chosen,
+            meta.clone(),
+            check,
+        )
         .await
         .map_err(storage_err)?;
     Ok(S3Response::new(complete_output(i.bucket, i.key, &meta)))
