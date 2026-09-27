@@ -23,6 +23,7 @@ The first release implements the operations real SDKs call during ordinary objec
 | Listing | ListObjectsV2, ListObjects (v1) | prefix, delimiter, CommonPrefixes, start-after / marker, continuation tokens, max-keys, encoding-type=url |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads | SDKs switch to multipart automatically above \~8 MB, so this is non-optional |
 | Metadata | Content-Type, Content-Encoding, Cache-Control, Content-Disposition, `x-amz-meta-*`, ETag, Last-Modified | Stored verbatim and returned on GET/HEAD; `x-amz-metadata-directive` on copy |
+| Versioning | PutBucketVersioning, GetBucketVersioning, ListObjectVersions; `versionId` on GetObject, HeadObject, DeleteObject, DeleteObjects, the object tagging operations and copy sources | `Enabled` and `Suspended` with AWS's null-version semantics; delete markers; `x-amz-version-id`, `x-amz-delete-marker` and `x-amz-copy-source-version-id` headers. MFA delete is refused (`NotImplemented`) |
 | Tagging | PutObjectTagging, GetObjectTagging, DeleteObjectTagging, PutBucketTagging, GetBucketTagging, DeleteBucketTagging | A string map on the metadata row; x-amz-tagging (URL-query-encoded) on PUT and x-amz-tagging-directive on copy. Half a day of work, no interaction with anything else |
 | Auth | SigV4 header and query (presigned URL) signing; path-style and virtual-host addressing | Lenient by default, strict verification behind a flag (see Key design decisions) |
 | Uploads | `aws-chunked` streaming bodies, `Expect: 100-continue`, `Content-MD5`, `x-amz-checksum-*` (CRC32, CRC32C, SHA1, SHA256) | These are SDK defaults, not edge cases |
@@ -38,15 +39,14 @@ Two tiers. **Deferred** features are designed for but not built until a real con
 
 | Deferred | What it costs | Why not now |
 | --- | --- | --- |
-| Versioning | Metadata key gains a version id and a "current" pointer; delete markers as a row type; `?versionId=` on GET/HEAD/DELETE; a new `ListObjectVersions` with `KeyMarker` + `VersionIdMarker` pagination; ListObjectsV2 skipping delete-marker keys; `DeleteObjects` returning per-entry version ids; `Enabled` vs `Suspended` null-version semantics; real blob refcounting because old versions pin blobs | Roughly 2-3x the object-path surface. Every existing operation grows a second code path. Content-addressed, refcounted blobs mean nothing in v1 has to be undone to add it. |
-| Object Lock (retention, legal hold) | Two fields on a version row, six small handlers, a check in DELETE, Compliance vs Governance and `x-amz-bypass-governance-retention`. Time-based retention needs a mockable clock (`--now` override) so tests stay deterministic | Cheap on its own but requires versioning. Ships with it or not at all. |
+| Object Lock (retention, legal hold) | Two fields on a version row, six small handlers, a check in DELETE, Compliance vs Governance and `x-amz-bypass-governance-retention`. Time-based retention needs a mockable clock (`--now` override) so tests stay deterministic | Next: it builds on versioning, whose version rows carry the lock fields. See [TODO/object-lock.md](../TODO/object-lock.md). |
 
 **Never built**
 
 | Never built | Why |
 | --- | --- |
 | Multi-node, clustering, replication, erasure coding | The whole point is one node. Durability is the test harness's problem, not ours. |
-| Lifecycle rules, expiration, storage classes, Glacier restore | Time-based background behaviour has no place in a deterministic test fixture. |
+| Lifecycle rules, expiration, storage classes, Glacier restore | Time-based background behaviour has no place in a deterministic test fixture. `x-amz-storage-class` is accepted and echoed so SDK calls succeed; nothing is tiered. |
 | IAM, bucket policies, ACLs, Object Ownership, block-public-access | A second product, not a feature: principals and session tokens (so STS), a JSON policy evaluator with deny-wins and condition keys, bucket policies reconciled with ACLs. A fake would be wrong in exactly the cases someone tries to test. Strict SigV4 with one key pair covers "does my service sign correctly"; if per-principal isolation is ever needed, the answer is a static key-pair-to-bucket allow-list in config, not IAM. |
 | Server-side encryption (SSE-S3, SSE-KMS, SSE-C) | Headers are accepted and echoed so SDK calls succeed; nothing is actually encrypted. |
 | Event notifications (SNS, SQS, Lambda, EventBridge) | Would require emulating three other services. |
@@ -94,7 +94,7 @@ A PUT is durable and atomic at the point the metadata row commits; before that, 
 
 ```
 /data/
-  meta.redb                     # one redb file: objects, buckets, multipart uploads
+  meta.redb                     # one redb file: object versions, buckets, multipart uploads
   blobs/
     ab/cd/abcd0123...<sha256>   # immutable, content-addressed, fanned out 2 levels
   tmp/
@@ -108,8 +108,8 @@ A PUT is durable and atomic at the point the metadata row commits; before that, 
 2. `fsync` the temp file.
 3. Take the per-key lock for `bucket/key`.
 4. `rename(tmp/<uuid>, blobs/ab/cd/<sha256>)`. If the blob already exists (same content), delete the temp file instead. Rename is the atomic step for the bytes.
-5. Write the metadata row `{size, etag, sha256, content_type, user_meta, last_modified}` under key `bucket\0key` in a single redb transaction. Commit is the atomic step for visibility.
-6. If the key previously pointed at a different blob, decrement that blob's refcount; delete it at zero.
+5. Add the version row `{version_id, size, etag, sha256, content_type, user_meta, last_modified}` to the key's versions under `bucket\0key` in a single redb transaction, together with the blob refcounts. Commit is the atomic step for visibility.
+6. If the write replaced a version (the null version, see below), decrement its blob's refcount; delete the blob at zero.
 7. Release the lock, return `200` with the ETag.
 
 **Why content-addressed blobs**
@@ -119,13 +119,23 @@ A PUT is durable and atomic at the point the metadata row commits; before that, 
 - Two-level fan-out keeps any one directory small even at a million objects.
 - Overwrites are naturally atomic: the new row points at the new blob; readers holding the old blob open keep reading it until they close.
 
+**Versions**
+
+Every key holds a list of versions, newest first; the first is the current one, so there is no separate "current" pointer. In the fs backend the whole list is the value of the key's one row in the `objects` table, so every write stays a single read-modify-write of one row in one transaction. That makes a write O(versions of that key), which is fine for a test fixture.
+
+- A version row is the object's metadata plus a version id. A delete marker is a version with no blob.
+- The service picks the id of each write from the bucket's versioning state: a fresh opaque id when `Enabled` (ids are unique and sort newest first), otherwise `null`. Writing a `null` version replaces any existing null version, so an unversioned or `Suspended` bucket overwrites in place while older non-null versions stay.
+- DELETE without a version id removes the null version in an unversioned bucket and otherwise writes a delete marker (with a fresh id when `Enabled`, as the null version when `Suspended`). DELETE with a version id removes exactly that version; the next newest becomes current, which is how deleting a delete marker undeletes.
+- Every version with a blob holds one reference on it, so old versions pin blobs and a copy of an old version shares its bytes. The startup sweep recounts references over every version of every key.
+- Rows written before versioning (`{blob, meta}`, one per key) are read as a single null version; no migration step runs, and they are rewritten in the new format on their next write.
+
 **Multipart**
 
 Parts land in `uploads/<id>/` as ordinary hashed temp files. Complete validates part numbers and sizes (every part but the last must be at least 5 MB), concatenates parts into a single blob with the AWS ETag formula `md5(concat(part_md5s))-N`, then follows steps 3-7. Abort deletes the directory. Uploads with no activity for 24 hours are swept on startup only; there is no background reaper.
 
 **Memory backend**
 
-The same trait over a `BTreeMap<(Bucket, Key), Object>` behind an `RwLock`, with bodies as `Bytes`. The ordered map gives prefix listing for free. Nothing is written anywhere; the container's memory limit is the storage limit.
+The same trait over a `BTreeMap<(Bucket, Key), Vec<Version>>` behind an `RwLock`, with bodies as `Bytes`; the version-list rules above are shared code. The ordered map gives prefix listing for free. Nothing is written anywhere; the container's memory limit is the storage limit.
 
 ## Container and configuration
 
@@ -182,7 +192,7 @@ Most S3 fakes fail not on the happy path but on the defaults SDKs quietly turn o
 
 The definition of "correct" is "real SDKs and existing conformance suites pass"; hand-written unit tests come second.
 
-1. **Ceph `s3-tests`** (the de facto S3 conformance suite) run in CI against both backends, with a checked-in allowlist of tests that fail because they exercise out-of-scope features (versioning, ACLs, lifecycle). The allowlist can only shrink.
+1. **Ceph `s3-tests`** (the de facto S3 conformance suite) run in CI against both backends, with a checked-in allowlist of tests that fail because they exercise out-of-scope features (Object Lock, ACLs, lifecycle). The allowlist can only shrink.
 2. **MinIO `mint`** for a second opinion on multipart and listing edge cases.
 3. **SDK smoke tests**, one small program per SDK, each doing: create bucket, put small, put 20 MB (forces multipart), list with prefix and delimiter, range get, copy, presigned get, batch delete, delete bucket. SDKs covered: boto3, aws-sdk-go-v2, aws-sdk-js v3, aws-sdk-java v2, the AWS CLI, rclone.
 4. **Differential tests** that replay the same recorded request sequence against a real S3 bucket and this service and diff the responses, ignoring request ids and dates. Run nightly, not per commit.
@@ -197,4 +207,4 @@ A change that makes any SDK smoke test fail does not merge.
 - [ ] Should the memory backend enforce a configurable size cap and return `EntityTooLarge`, or let the container OOM?
 - [ ] Is there any need for a `sleep`/latency-injection flag for testing client timeouts, or does that belong in a proxy?
 - [ ] Multipart orphan sweep on startup only, or also a `--sweep-interval` flag for long-running dev instances?
-- [ ] What triggers versioning + Object Lock leaving the deferred tier: a named internal consumer, or a failing SDK smoke test?
+- [x] What triggers versioning + Object Lock leaving the deferred tier: a named internal consumer, or a failing SDK smoke test? Neither: moved in scope by decision. Versioning is built; Object Lock is next

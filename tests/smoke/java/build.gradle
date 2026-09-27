@@ -1,0 +1,25 @@
+plugins {
+    id 'application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation platform('software.amazon.awssdk:bom:2.55.6')
+    implementation 'software.amazon.awssdk:s3'
+    implementation 'org.slf4j:slf4j-nop:2.0.17'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+application {
+    mainClass = 'Smoke'
+    // Netty (async client) still uses sun.misc.Unsafe.
+    applicationDefaultJvmArgs = ['--sun-misc-unsafe-memory-access=allow']
+}

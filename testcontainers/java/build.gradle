@@ -1,0 +1,28 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'io.github.camconn'
+version = '0.1.0'
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(25) }
+}
+
+repositories { mavenCentral() }
+
+dependencies {
+    api 'org.testcontainers:testcontainers:2.0.5'
+    testImplementation platform('software.amazon.awssdk:bom:2.55.6')
+    testImplementation 'software.amazon.awssdk:s3'
+    testImplementation platform('org.junit:junit-bom:6.1.3')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testRuntimeOnly 'org.slf4j:slf4j-simple:2.0.17'
+}
+
+test {
+    useJUnitPlatform()
+    environment 'GB_TEST_IMAGE', System.getenv('GB_TEST_IMAGE') ?: 'garbagebin:latest'
+    testLogging { events 'failed'; exceptionFormat = 'full' }
+}

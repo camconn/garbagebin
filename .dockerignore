@@ -1,3 +1,9 @@
 target
 .git
+.github
 data
+docs
+scripts
+tests
+testcontainers
+TODO

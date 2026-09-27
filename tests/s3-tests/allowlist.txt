@@ -1,0 +1,76 @@
+# Ceph s3-tests expected to fail: out-of-scope features (docs/design.md "Out of scope"), RGW
+# expectations that differ from AWS, and harness artefacts.
+# fnmatch globs against the test function name. This list only shrinks; scripts/s3-tests.sh
+# reports patterns whose tests all pass.
+
+# ACLs, policies, ownership, public access (including tests that set an ACL as setup)
+*acl*
+*policy*
+*public*
+*ownership*
+*_grant*
+*canned*
+*authenticated*
+test_access_bucket_private_object*_private
+test_bucket_create_special_key_names
+test_bucket_list_return_data
+test_bucket_list_return_data_versioning
+test_list_multipart_upload_owner
+
+# Object Lock (deferred, TODO/object-lock.md)
+*object_lock*
+*retention*
+*legal_hold*
+
+# Lifecycle, storage classes, restore
+*lifecycle*
+*expiration*
+*transition*
+*restore*
+
+# Encryption (headers echoed, nothing encrypted)
+*sse*
+*encrypt*
+*kms*
+
+# Other never-built surfaces
+*cors*
+test_object_raw_get_x_amz_expires_not_expired  # OPTIONS on a presigned URL: a CORS preflight
+*logging*
+*tenant*  # one namespace, no tenants
+*torrent*
+
+# Browser POST uploads
+*_post_*
+
+# Lenient auth by default: missing or bad credentials are accepted
+*anonymous*
+*anon_*
+*bad_authorization*
+*bad_auth
+*invalid_auth
+test_100_continue  # an unsigned PUT to a private bucket must get 403 before 100 Continue
+test_object_raw_get_x_amz_expires_out_*
+
+# One namespace, one key pair: no per-user ownership
+*nonowner*
+*not_owned*
+test_expected_bucket_owner
+
+# Not in the operation list
+*object_attributes*
+*crc64nvme*
+test_multipart_use_cksum_helper_*  # assert via GetObjectAttributes
+
+# RGW expectations that differ from AWS
+test_object_set_get_unicode_metadata  # AWS returns non-ASCII metadata RFC 2047-encoded, as gb does (marked fails_on_rgw)
+test_bucket_get_location  # creates with LocationConstraint=us-east-1; AWS rejects that and reports us-east-1 as null
+test_multipart_get_part  # out-of-range partNumber: AWS answers 416 InvalidPartNumber, the test wants 400 InvalidPart
+test_multipart_single_get_part  # same
+test_non_multipart_get_part  # same
+test_delete_marker_nonversioned  # wants x-amz-delete-marker: false on a 404; AWS omits the header when false
+test_object_read_unreadable  # wants 400 for a valid UTF-8 key with a C1 control char; no such AWS rule (marked fails_on_rgw)
+
+# Harness artefacts
+test_object_create_bad_contentlength_none  # botocore re-adds Content-Length after the test strips it
+test_list_buckets_paginated  # needs a server with no other buckets; races with parallel workers (passes run alone)

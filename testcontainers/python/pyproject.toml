@@ -1,0 +1,14 @@
+[project]
+name = "testcontainers-garbagebin"
+version = "0.1.0"
+description = "Testcontainers module for the Garbage Bin S3 server"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = ["testcontainers>=4.15"]
+
+[dependency-groups]
+dev = ["boto3", "pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

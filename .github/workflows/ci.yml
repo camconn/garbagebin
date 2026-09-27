@@ -16,3 +16,38 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [memory, fs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/smoke/boto3/smoke.py
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/smoke/go/go.mod
+          cache-dependency-path: tests/smoke/go/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: tests/smoke/js/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: gradle
+          cache-dependency-path: tests/smoke/java/*.gradle
+      # AWS CLI v2 is preinstalled on ubuntu-latest.
+      - run: curl -fsSL https://rclone.org/install.sh | sudo bash
+      - run: cargo build --release --locked
+      - run: scripts/smoke.sh --backend ${{ matrix.backend }}
+        timeout-minutes: 10

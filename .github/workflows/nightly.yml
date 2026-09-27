@@ -1,0 +1,71 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  # Replays tests/differential scenarios against real S3 and gb. Needs repo secrets.
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: cargo build --release --locked
+      - name: Start gb
+        run: |
+          S3_LISTEN=127.0.0.1:9000 target/release/gb > gb.log 2>&1 &
+          timeout 30 sh -c 'until curl -fsS http://127.0.0.1:9000/health; do sleep 0.2; done'
+      - run: uv run tests/differential/diff.py
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          DIFF_B_ENDPOINT: http://127.0.0.1:9000
+          UV_HTTP_TIMEOUT: 300
+      - if: failure()
+        run: cat gb.log
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          tags: garbagebin:nightly
+          push: false
+
+  testcontainers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t garbagebin:latest .
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: testcontainers/go/go.mod
+          cache-dependency-path: testcontainers/go/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: gradle
+          cache-dependency-path: testcontainers/java/*.gradle
+      - run: go test ./...
+        working-directory: testcontainers/go
+      - run: uv run pytest -q
+        working-directory: testcontainers/python
+      - run: npm ci && npm test
+        working-directory: testcontainers/js
+      - run: ./gradlew test
+        working-directory: testcontainers/java

@@ -1,0 +1,90 @@
+name: conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  s3-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [memory, fs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/garbagebin/s3-tests
+          key: s3-tests-${{ hashFiles('scripts/s3-tests.sh') }}
+      - run: cargo build --release --locked
+      - name: Start gb
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          S3_BACKEND=${{ matrix.backend }} S3_DATA_DIR="$RUNNER_TEMP/data" S3_LISTEN=127.0.0.1:9000 \
+            nohup target/release/gb >"$RUNNER_TEMP/gb.log" 2>&1 &
+          timeout 30 bash -c 'until curl -fs http://127.0.0.1:9000/health; do sleep 0.2; done'
+      - run: scripts/s3-tests.sh
+        env:
+          S3_ENDPOINT: http://127.0.0.1:9000
+      - if: always()
+        run: cp "$RUNNER_TEMP/gb.log" target/s3-tests/ || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-tests-${{ matrix.backend }}
+          path: target/s3-tests/
+
+  mint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [memory, fs]
+    env:
+      MINT_IMAGE: garbagebin-mint:ci
+      MINT_TAR: ~/.cache/garbagebin/mint-image.tar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      # The image is built from source (minio/* is gone from Docker Hub); cache it as a tarball.
+      - id: mint-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.MINT_TAR }}
+          key: mint-image-${{ hashFiles('scripts/mint.sh', 'scripts/mint.Dockerfile') }}
+      - if: steps.mint-cache.outputs.cache-hit == 'true'
+        run: docker load -i ${{ env.MINT_TAR }}
+      - run: cargo build --release --locked
+      - name: Start gb
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          S3_BACKEND=${{ matrix.backend }} S3_DATA_DIR="$RUNNER_TEMP/data" S3_LISTEN=127.0.0.1:9000 S3_STRICT_AUTH=true \
+            nohup target/release/gb >"$RUNNER_TEMP/gb.log" 2>&1 &
+          timeout 30 bash -c 'until curl -fs http://127.0.0.1:9000/health; do sleep 0.2; done'
+      - run: scripts/mint.sh
+        env:
+          S3_ENDPOINT: http://127.0.0.1:9000
+      - id: mint-save
+        if: always() && steps.mint-cache.outputs.cache-hit != 'true'
+        run: |
+          docker image inspect "$MINT_IMAGE" >/dev/null 2>&1 || exit 0
+          mkdir -p ~/.cache/garbagebin
+          docker save "$MINT_IMAGE" -o ${{ env.MINT_TAR }}
+          echo saved=true >>"$GITHUB_OUTPUT"
+      - if: always() && steps.mint-save.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.MINT_TAR }}
+          key: mint-image-${{ hashFiles('scripts/mint.sh', 'scripts/mint.Dockerfile') }}
+      - if: always()
+        run: cp "$RUNNER_TEMP/gb.log" target/mint/ || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mint-${{ matrix.backend }}
+          path: target/mint/
