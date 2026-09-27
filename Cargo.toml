@@ -1,0 +1,40 @@
+[package]
+name = "garbagebin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Garbage Bin: a single-node, S3-compatible object store for local development and integration tests"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "gb"
+path = "src/main.rs"
+
+[dependencies]
+# Protocol layer: S3 routing, SigV4, XML, aws-chunked, multipart plumbing.
+s3s = "0.17"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "net", "sync", "io-util"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio"] }
+
+# Storage.
+redb = "4"
+bytes = "1"
+md-5 = "0.11"
+sha2 = "0.11"
+uuid = { version = "1", features = ["v4"] }
+
+# Config, logging, errors.
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
