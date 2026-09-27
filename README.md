@@ -4,7 +4,7 @@ A single-process, S3-compatible object store that runs as one Docker container f
 integration tests. Unmodified AWS SDKs work against it with only an endpoint override.
 
 Package `garbagebin`, binary `gb`. Status: scaffolding only. See [TASKS.md](TASKS.md) for the plan and the
-[design doc](https://claude.ai/artifact/XLreSkVHLKdHnXn3aqVjdP) for rationale.
+[design doc](docs/design.md) for rationale.
 
 ## Development
 
