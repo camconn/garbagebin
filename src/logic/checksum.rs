@@ -241,11 +241,22 @@ pub fn requested(
         .filter(|a| a.get(expected).is_some())
         .collect();
     out.extend(sdk_algorithm.and_then(Algorithm::parse));
-    for v in headers.get_all("x-amz-trailer") {
-        let names = v.to_str().unwrap_or_default().split(',');
-        out.extend(names.filter_map(Algorithm::parse));
-    }
+    out.extend(declared_trailers(headers));
     out
+}
+
+/// Checksums a request names in `x-amz-trailer`.
+fn declared_trailers(headers: &HeaderMap) -> impl Iterator<Item = Algorithm> + '_ {
+    headers
+        .get_all("x-amz-trailer")
+        .iter()
+        .flat_map(|v| v.to_str().unwrap_or_default().split(','))
+        .filter_map(Algorithm::parse)
+}
+
+/// The first checksum declared in `x-amz-trailer` that did not arrive as a trailer.
+pub fn missing_trailer(headers: &HeaderMap, trailers: Option<&HeaderMap>) -> Option<Algorithm> {
+    declared_trailers(headers).find(|a| trailers.is_none_or(|t| !t.contains_key(a.header())))
 }
 
 /// The first checksum a request names (value header, algorithm header or `x-amz-trailer`)

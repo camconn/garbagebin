@@ -150,6 +150,24 @@ pub async fn upload_part<S: Storage>(
     );
     let sdk_algorithm =
         algorithm(i.checksum_algorithm.as_ref()).or(upload.checksum_algorithm.as_deref());
+    // A part must carry the upload's checksum; any other could not be combined on complete.
+    if let Some(want) = upload
+        .checksum_algorithm
+        .as_deref()
+        .and_then(Algorithm::parse)
+    {
+        let sent = checksum::requested(&expected, sdk_algorithm, &req.headers);
+        if let Some(got) = sent.into_iter().find(|a| *a != want) {
+            return Err(error(
+                S3ErrorCode::InvalidRequest,
+                format!(
+                    "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: {}",
+                    want.name().to_ascii_lowercase(),
+                    got.name().to_ascii_lowercase()
+                ),
+            ));
+        }
+    }
     let staged = Upload {
         headers: &req.headers,
         trailers,
@@ -362,24 +380,29 @@ pub async fn complete_multipart_upload<S: Storage>(
         } else {
             checksum::composite(a, &parts)
         };
-        if let Some(v) = value {
-            // Only the upload's own algorithm is checked; others cannot be computed from parts.
-            let sent = expected_checksums(
-                i.checksum_crc32,
-                i.checksum_crc32c,
-                i.checksum_crc64nvme,
-                i.checksum_sha1,
-                i.checksum_sha256,
-            );
-            // minio-go sends a composite value without its `-N` suffix.
-            let suffix = format!("-{}", chosen.len());
-            let matches = |s: &String| *s == v || (!full && v.strip_suffix(&suffix) == Some(s));
-            if a.get(&sent).is_some_and(|s| !matches(s)) {
-                return Err(digest_error(BodyError::Checksum(a)));
-            }
-            a.set(&mut meta.checksums, Some(v));
-            meta.checksums.checksum_type = upload.checksum_type.clone();
+        // Every part carries the upload's algorithm, so a value is always computable.
+        let Some(v) = value else {
+            return Err(error(
+                S3ErrorCode::InvalidRequest,
+                format!("A part is missing its {} checksum.", a.header()),
+            ));
+        };
+        // Only the upload's own algorithm is checked; others cannot be computed from parts.
+        let sent = expected_checksums(
+            i.checksum_crc32,
+            i.checksum_crc32c,
+            i.checksum_crc64nvme,
+            i.checksum_sha1,
+            i.checksum_sha256,
+        );
+        // minio-go sends a composite value without its `-N` suffix.
+        let suffix = format!("-{}", chosen.len());
+        let matches = |s: &String| *s == v || (!full && v.strip_suffix(&suffix) == Some(s));
+        if a.get(&sent).is_some_and(|s| !matches(s)) {
+            return Err(digest_error(BodyError::Checksum(a)));
         }
+        a.set(&mut meta.checksums, Some(v));
+        meta.checksums.checksum_type = upload.checksum_type.clone();
     }
     gb.storage
         .complete_upload_if(

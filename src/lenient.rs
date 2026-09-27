@@ -160,6 +160,10 @@ impl Stream for ChunkedDecoder {
                             .ok()
                             .and_then(|s| usize::from_str_radix(s, 16).ok());
                         self.state = match size {
+                            // Fewer bytes than `x-amz-decoded-content-length` declared.
+                            Some(0) if self.remaining.is_some_and(|r| r != 0) => {
+                                return Poll::Ready(Some(Err(MalformedChunk.into())));
+                            }
                             Some(0) => State::Trailers,
                             Some(n) => State::Data(n),
                             None => return Poll::Ready(Some(Err(MalformedChunk.into()))),
@@ -179,7 +183,10 @@ impl Stream for ChunkedDecoder {
                         State::Data(n - take)
                     };
                     if let Some(r) = &mut self.remaining {
-                        *r = r.saturating_sub(take);
+                        let Some(left) = r.checked_sub(take) else {
+                            return Poll::Ready(Some(Err(MalformedChunk.into())));
+                        };
+                        *r = left;
                     }
                     return Poll::Ready(Some(Ok(data)));
                 }
@@ -314,6 +321,19 @@ mod tests {
         let mut req = request("/b/k", b"b\r\nhello", true);
         strip_auth(&mut req);
         assert!(collect(req.body_mut()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_decoded_length() {
+        // Declared length is 11.
+        for body in [
+            &b"3\r\nabc\r\n0\r\n\r\n"[..],
+            b"c\r\nhello world!\r\n0\r\n\r\n",
+        ] {
+            let mut req = request("/b/k", body, true);
+            strip_auth(&mut req);
+            assert!(collect(req.body_mut()).await.is_err());
+        }
     }
 
     struct Chunks(std::collections::VecDeque<Result<Bytes, StdError>>);

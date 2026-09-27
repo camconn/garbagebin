@@ -584,8 +584,8 @@ pub async fn copy_object<S: Storage>(
         customer_key_md5: i.sse_customer_key_md5,
         bucket_key_enabled: i.bucket_key_enabled,
     };
-    if !src.part_sizes.is_empty() {
-        let requested = algorithm(i.checksum_algorithm.as_ref()).and_then(Algorithm::parse);
+    let requested = algorithm(i.checksum_algorithm.as_ref()).and_then(Algorithm::parse);
+    if !src.part_sizes.is_empty() || requested.is_some_and(|a| a.get(&src.checksums).is_none()) {
         single_part(gb, src_bucket, src_key, &src, requested, &mut meta).await?;
     }
     gb.storage

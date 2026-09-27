@@ -71,10 +71,19 @@ impl<S: Storage> GarbageBin<S> {
             checksum::check_content_md5(md5.to_str().unwrap_or_default(), &digests.md5)
                 .map_err(|e| digest_error(BodyError::Md5(e)))?;
         }
-        checksum::merge_trailers(
-            &mut expected,
-            upload.trailers.and_then(|t| t.take()).as_ref(),
-        );
+        let trailers = upload.trailers.and_then(|t| t.take());
+        if let Some(a) = checksum::missing_trailer(upload.headers, trailers.as_ref()) {
+            let mut err = S3Error::with_message(
+                S3ErrorCode::Custom("MalformedTrailerError".into()),
+                format!(
+                    "The request declared a {} trailer that was not sent.",
+                    a.header()
+                ),
+            );
+            err.set_status_code(http::StatusCode::BAD_REQUEST);
+            return Err(err);
+        }
+        checksum::merge_trailers(&mut expected, trailers.as_ref());
         if let Some(a) = checksum::mismatch(&expected, &digests.checksums) {
             return Err(digest_error(BodyError::Checksum(a)));
         }
