@@ -182,7 +182,12 @@ async fn objects_and_metadata(b: Backend) {
     // Default content type is AWS's, not application/octet-stream. The SDK
     // always sends one, so use a raw request.
     let r = s
-        .raw(Request::put("/bkt/plain").body(Full::default()).unwrap())
+        .raw(
+            Request::put("/bkt/plain")
+                .header("content-length", "0")
+                .body(Full::default())
+                .unwrap(),
+        )
         .await;
     assert_eq!(r.status, 200);
     let head = c
@@ -1943,6 +1948,35 @@ async fn xml_body_digests(b: Backend) {
     let good = base64::engine::general_purpose::STANDARD.encode(Md5::digest(xml));
     let r = s.raw(tagging(&good)).await;
     assert_eq!(r.status, 200, "{}", r.text());
+
+    // A digest is required, as AWS's model marks these operations.
+    let versioning = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let delete = "<Delete><Object><Key>k</Key></Object></Delete>";
+    // An algorithm name alone is no digest.
+    for (method, path, body, algorithm) in [
+        ("PUT", "/bkt/k?tagging", xml, None),
+        ("PUT", "/bkt?versioning", versioning, None),
+        ("POST", "/bkt?delete", delete, None),
+        ("POST", "/bkt?delete", delete, Some("CRC32")),
+    ] {
+        let mut r = Request::builder().method(method).uri(path);
+        if let Some(a) = algorithm {
+            r = r.header("x-amz-sdk-checksum-algorithm", a);
+        }
+        let r = s
+            .raw(
+                r.body(Full::new(Bytes::from_static(body.as_bytes())))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(r.status, 400, "{path}");
+        assert!(
+            r.text().contains("<Code>InvalidRequest</Code>"),
+            "{}",
+            r.text()
+        );
+    }
+    c.head_object().bucket("bkt").key("k").send().await.unwrap();
 }
 
 async fn complete(
@@ -2408,6 +2442,7 @@ async fn storage_class_echoed(b: Backend) {
         .raw(
             Request::put("/bkt/bad")
                 .header("x-amz-storage-class", "BOGUS")
+                .header("content-length", "0")
                 .body(Full::default())
                 .unwrap(),
         )
@@ -2420,14 +2455,214 @@ async fn storage_class_echoed(b: Backend) {
     );
 }
 
+/// Declared integrity checks cannot be dodged by omitting or mixing them.
+async fn checksum_integrity(b: Backend) {
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+
+    // A part checksummed with another algorithm than the upload's.
+    let id = c
+        .create_multipart_upload()
+        .bucket("bkt")
+        .key("mp")
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .send()
+        .await
+        .unwrap()
+        .upload_id
+        .unwrap();
+    let e = c
+        .upload_part()
+        .bucket("bkt")
+        .key("mp")
+        .upload_id(&id)
+        .part_number(1)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .body(ByteStream::from_static(b"abc"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(e.as_service_error().unwrap()), "InvalidRequest");
+    let r = s
+        .raw(
+            Request::put(format!("/bkt/mp?partNumber=1&uploadId={id}"))
+                .header("x-amz-checksum-crc32", "NSRBwg==")
+                .body(Full::new(Bytes::from_static(b"abc")))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    assert!(
+        r.text().contains("<Code>InvalidRequest</Code>"),
+        "{}",
+        r.text()
+    );
+
+    // aws-chunked framing that disagrees with the declared length, or drops a declared trailer.
+    let chunked = |decoded: &str, body: &'static [u8]| {
+        Request::put("/bkt/raw")
+            .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+            .header("x-amz-decoded-content-length", decoded)
+            .header("x-amz-trailer", "x-amz-checksum-sha256")
+            .header("content-length", body.len())
+            .body(Full::new(Bytes::from_static(body)))
+            .unwrap()
+    };
+    let with_trailer =
+        b"3\r\nabc\r\n0\r\nx-amz-checksum-sha256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=\r\n\r\n";
+    for decoded in ["1", "100"] {
+        let r = s.raw(chunked(decoded, with_trailer)).await;
+        assert_eq!(r.status, 400, "{decoded}");
+        assert!(
+            r.text().contains("<Code>IncompleteBody</Code>"),
+            "{}",
+            r.text()
+        );
+    }
+    let r = s.raw(chunked("3", b"3\r\nabc\r\n0\r\n\r\n")).await;
+    assert_eq!(r.status, 400);
+    assert!(
+        r.text().contains("<Code>MalformedTrailerError</Code>"),
+        "{}",
+        r.text()
+    );
+    let r = s.raw(chunked("3", with_trailer)).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = s.raw_get("/bkt/raw").await;
+    assert_eq!(&r.body[..], b"abc");
+
+    // CopyObject computes a requested checksum for a single-part source without one.
+    let r = s
+        .raw(
+            Request::put("/bkt/plain")
+                .header("content-length", "3")
+                .body(Full::new(Bytes::from_static(b"abc")))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let head = c
+        .head_object()
+        .bucket("bkt")
+        .key("plain")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.checksum_sha256(), None);
+    let out = c
+        .copy_object()
+        .bucket("bkt")
+        .key("copy")
+        .copy_source("bkt/plain")
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .send()
+        .await
+        .unwrap();
+    let sha = "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=";
+    assert_eq!(
+        out.copy_object_result().unwrap().checksum_sha256(),
+        Some(sha)
+    );
+    let head = c
+        .head_object()
+        .bucket("bkt")
+        .key("copy")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.checksum_sha256(), Some(sha));
+}
+
+/// A body with no declared length is refused, not stored empty.
+async fn missing_content_length(b: Backend) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let id = c
+        .create_multipart_upload()
+        .bucket("bkt")
+        .key("mp")
+        .send()
+        .await
+        .unwrap()
+        .upload_id
+        .unwrap();
+
+    // Raw socket: hyper's client picks its own framing for an empty body.
+    let put = async |path: &str, framing: &str| {
+        let mut conn = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+        let req = format!(
+            "PUT {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{framing}",
+            s.addr
+        );
+        conn.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        conn.read_to_string(&mut resp).await.unwrap();
+        resp
+    };
+    for path in ["/bkt/k", &format!("/bkt/mp?partNumber=1&uploadId={id}")] {
+        let resp = put(path, "\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 411"), "{path}: {resp}");
+        assert!(resp.contains("<Code>MissingContentLength</Code>"), "{resp}");
+    }
+    assert_eq!(s.raw_get("/bkt/k").await.status, 404);
+
+    for framing in [
+        "Content-Length: 0\r\n\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    ] {
+        let resp = put("/bkt/k", framing).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{framing}: {resp}");
+    }
+
+    // Lenient aws-chunked with no decoded length has no usable length.
+    let resp = put(
+        "/bkt/k",
+        "x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\nContent-Length: 13\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 411"), "{resp}");
+    assert!(resp.contains("x-amz-decoded-content-length"), "{resp}");
+
+    // An unframed XML body is left to s3s, which wants its length; the digest is not judged.
+    let resp = put(
+        "/bkt?tagging",
+        "Content-MD5: AAAAAAAAAAAAAAAAAAAAAA==\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n<\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 411"), "{resp}");
+
+    // HTTP/2 frames the body itself; a streamed one of unknown length carries no Content-Length.
+    let io = hyper_util::rt::TokioIo::new(tokio::net::TcpStream::connect(s.addr).await.unwrap());
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let chunks = futures::stream::iter([Ok::<_, std::convert::Infallible>(
+        hyper::body::Frame::data(Bytes::from_static(b"h2")),
+    )]);
+    let req = Request::put(format!("http://{}/bkt/h2", s.addr))
+        .body(http_body_util::StreamBody::new(chunks))
+        .unwrap();
+    assert!(!req.headers().contains_key("content-length"));
+    let resp = h2.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(&s.raw_get("/bkt/h2").await.body[..], b"h2");
+}
+
 /// A checksum the server cannot compute is refused, not stored unverified.
 async fn unsupported_checksum_rejected(b: Backend) {
     let s = start(b).await;
     let c = s.client();
     c.create_bucket().bucket("bkt").send().await.unwrap();
     for (name, value) in [
-        ("x-amz-checksum-md5", "1B2M2Y8AsgTpgAmY7PhCfg=="),
-        ("x-amz-sdk-checksum-algorithm", "SHA512"),
+        ("x-amz-checksum-blake3", "1B2M2Y8AsgTpgAmY7PhCfg=="),
+        ("x-amz-sdk-checksum-algorithm", "BLAKE3"),
     ] {
         let r = s
             .raw(
@@ -2458,7 +2693,7 @@ async fn unsupported_checksum_rejected(b: Backend) {
     let r = s
         .raw(
             Request::post("/bkt/k?uploads")
-                .header("x-amz-checksum-algorithm", "MD5")
+                .header("x-amz-checksum-algorithm", "BLAKE3")
                 .body(Full::default())
                 .unwrap(),
         )
@@ -2469,6 +2704,269 @@ async fn unsupported_checksum_rejected(b: Backend) {
         "{}",
         r.text()
     );
+}
+
+/// MD5, SHA512 and the XXHASH family are verified, stored and echoed like the rest,
+/// and a multipart upload's part checksums are reported by partNumber reads.
+async fn newer_checksum_algorithms(b: Backend) {
+    use garbagebin::logic::checksum::Algorithm;
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let put = |key: &str, name: &str, value: &str, body: &'static [u8]| {
+        Request::put(format!("/bkt/{key}"))
+            .header(format!("x-amz-checksum-{name}"), value)
+            .body(Full::new(Bytes::from_static(body)))
+            .unwrap()
+    };
+    let head = |path: &str| {
+        Request::head(path)
+            .header("x-amz-checksum-mode", "ENABLED")
+            .body(Full::default())
+            .unwrap()
+    };
+
+    // Values from Python's hashlib and xxhash for "abc".
+    for (name, value) in [
+        ("md5", "kAFQmDzST7DWlj99KOF/cg=="),
+        (
+            "sha512",
+            "3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw==",
+        ),
+        ("xxhash64", "RLws9a13CZk="),
+        ("xxhash3", "eK9flIkvOVA="),
+        ("xxhash128", "BrBatnM6YYV4r1+UiS85UA=="),
+    ] {
+        let header = format!("x-amz-checksum-{name}");
+        let r = s.raw(put(name, name, value, b"abc")).await;
+        assert_eq!(r.status, 200, "{name}: {}", r.text());
+        assert_eq!(r.header(&header), Some(value));
+        let r = s.raw(head(&format!("/bkt/{name}"))).await;
+        assert_eq!(r.header(&header), Some(value), "{name}");
+        assert_eq!(r.header("x-amz-checksum-type"), Some("FULL_OBJECT"));
+
+        let r = s.raw(put("bad", name, value, b"abd")).await;
+        assert_eq!(r.status, 400, "{name}");
+        assert!(r.text().contains("<Code>BadDigest</Code>"), "{}", r.text());
+    }
+
+    // A composite XXHASH3 multipart upload.
+    let r = s
+        .raw(
+            Request::post("/bkt/mp?uploads")
+                .header("x-amz-checksum-algorithm", "XXHASH3")
+                .body(Full::default())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.header("x-amz-checksum-type"), Some("COMPOSITE"));
+    let text = r.text();
+    let id = text
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|t| t.split("</UploadId>").next())
+        .unwrap()
+        .to_owned();
+    let bodies = [Bytes::from(vec![7u8; 5 << 20]), Bytes::from_static(b"tail")];
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (n, data) in bodies.iter().enumerate() {
+        let n = n + 1;
+        let r = s
+            .raw(
+                Request::put(format!("/bkt/mp?partNumber={n}&uploadId={id}"))
+                    .header("x-amz-checksum-xxhash3", Algorithm::XxHash3.digest(data))
+                    .body(Full::new(data.clone()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let etag = r.header("etag").unwrap();
+        xml += &format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>");
+    }
+    xml += "</CompleteMultipartUpload>";
+    let r = s
+        .raw(
+            Request::post(format!("/bkt/mp?uploadId={id}"))
+                .body(Full::new(Bytes::from(xml)))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.text().contains("-2</ChecksumXXHASH3>"), "{}", r.text());
+
+    let r = s.raw(head("/bkt/mp")).await;
+    assert!(r.header("x-amz-checksum-xxhash3").unwrap().ends_with("-2"));
+    for (n, data) in bodies.iter().enumerate() {
+        let r = s.raw(head(&format!("/bkt/mp?partNumber={}", n + 1))).await;
+        let want = Algorithm::XxHash3.digest(data);
+        assert_eq!(r.header("x-amz-checksum-xxhash3"), Some(want.as_str()));
+        assert_eq!(r.header("x-amz-checksum-type"), Some("COMPOSITE"));
+    }
+    let r = s
+        .raw(
+            Request::get("/bkt/mp?partNumber=2")
+                .header("x-amz-checksum-mode", "ENABLED")
+                .body(Full::default())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(&r.body[..], b"tail");
+    let want = Algorithm::XxHash3.digest(b"tail");
+    assert_eq!(r.header("x-amz-checksum-xxhash3"), Some(want.as_str()));
+    // A byte range has no checksum; partNumber=1 of a single-part object is the whole object.
+    let r = s
+        .raw(
+            Request::get("/bkt/mp")
+                .header("x-amz-checksum-mode", "ENABLED")
+                .header("range", "bytes=0-1")
+                .body(Full::default())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.header("x-amz-checksum-xxhash3"), None);
+    let r = s.raw(head("/bkt/md5?partNumber=1")).await;
+    assert_eq!(
+        r.header("x-amz-checksum-md5"),
+        Some("kAFQmDzST7DWlj99KOF/cg==")
+    );
+}
+
+/// What AWS reports for objects stored without a checksum or SSE: a CRC64NVME it computed, and
+/// SSE-S3 (`AES256`) from default bucket encryption.
+async fn aws_defaults(b: Backend) {
+    use aws_sdk_s3::types::ChecksumType;
+    use base64::Engine as _;
+    use garbagebin::logic::checksum::Algorithm;
+    use md5::{Digest, Md5};
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let put = |key: &str, headers: &[(&str, &str)]| {
+        let mut r = Request::put(format!("/bkt/{key}")).header("content-length", "3");
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        r.body(Full::new(Bytes::from_static(b"abc"))).unwrap()
+    };
+    let head = |key: &str| {
+        Request::head(format!("/bkt/{key}"))
+            .header("x-amz-checksum-mode", "ENABLED")
+            .body(Full::default())
+            .unwrap()
+    };
+    let crc = Algorithm::Crc64Nvme.digest(b"abc");
+
+    let r = s.raw(put("plain", &[])).await;
+    assert_eq!(r.header("x-amz-checksum-crc64nvme"), Some(crc.as_str()));
+    assert_eq!(r.header("x-amz-checksum-type"), Some("FULL_OBJECT"));
+    assert_eq!(r.header("x-amz-server-side-encryption"), Some("AES256"));
+    let r = s.raw(head("plain")).await;
+    assert_eq!(r.header("x-amz-checksum-crc64nvme"), Some(crc.as_str()));
+    assert_eq!(r.header("x-amz-server-side-encryption"), Some("AES256"));
+    let r = s.raw_get("/bkt/plain").await;
+    assert_eq!(r.header("x-amz-checksum-crc64nvme"), None);
+    assert_eq!(r.header("x-amz-server-side-encryption"), Some("AES256"));
+
+    // A named checksum replaces the default; named SSE is reported as sent.
+    let r = s
+        .raw(put(
+            "named",
+            &[
+                ("x-amz-checksum-crc32", "NSRBwg=="),
+                ("x-amz-server-side-encryption", "aws:kms"),
+            ],
+        ))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.header("x-amz-checksum-crc64nvme"), None);
+    assert_eq!(r.header("x-amz-server-side-encryption"), Some("aws:kms"));
+    // SSE-C objects report no SSE-S3.
+    let b64 = |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(d);
+    let key = [7u8; 32];
+    let (key_b64, key_md5) = (b64(&key), b64(&Md5::digest(key)));
+    let r = s
+        .raw(put(
+            "ssec",
+            &[
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                ("x-amz-server-side-encryption-customer-key", &key_b64),
+                ("x-amz-server-side-encryption-customer-key-md5", &key_md5),
+            ],
+        ))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.header("x-amz-server-side-encryption"), None);
+
+    // A multipart upload created without a checksum gets a FULL_OBJECT CRC64NVME, including
+    // for a copied part.
+    let id = new_upload(&c, "mp").await;
+    let first = vec![3u8; 5 << 20];
+    let out = c
+        .upload_part()
+        .bucket("bkt")
+        .key("mp")
+        .upload_id(&id)
+        .part_number(1)
+        .body(ByteStream::from(first.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        out.server_side_encryption().map(|e| e.as_str()),
+        Some("AES256")
+    );
+    let copied = c
+        .upload_part_copy()
+        .bucket("bkt")
+        .key("mp")
+        .upload_id(&id)
+        .part_number(2)
+        .copy_source("bkt/plain")
+        .send()
+        .await
+        .unwrap();
+    let parts = vec![
+        CompletedPart::builder()
+            .part_number(1)
+            .e_tag(out.e_tag().unwrap())
+            .build(),
+        CompletedPart::builder()
+            .part_number(2)
+            .e_tag(copied.copy_part_result().unwrap().e_tag().unwrap())
+            .build(),
+    ];
+    let e = c
+        .complete_multipart_upload()
+        .bucket("bkt")
+        .key("mp")
+        .upload_id(&id)
+        .checksum_crc64_nvme("AAAAAAAAAAA=")
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(parts.clone()))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(e.as_service_error().unwrap()), "BadDigest");
+    let done = complete(&c, "mp", &id, parts).await.unwrap();
+    let whole = Algorithm::Crc64Nvme.digest(&[&first[..], b"abc"].concat());
+    assert_eq!(done.checksum_crc64_nvme(), Some(whole.as_str()));
+    assert_eq!(done.checksum_type(), Some(&ChecksumType::FullObject));
+    let got = c
+        .get_object()
+        .bucket("bkt")
+        .key("mp")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.checksum_crc64_nvme(), Some(whole.as_str()));
+    assert_eq!(body(got).await.len(), first.len() + 3);
+    let r = s.raw(head("mp?partNumber=2")).await;
+    assert_eq!(r.header("x-amz-checksum-crc64nvme"), Some(crc.as_str()));
 }
 
 async fn conditional_delete(b: Backend) {
@@ -2887,7 +3385,11 @@ backend_tests!(
     empty_content_md5,
     list_v1_prefix_unencoded,
     storage_class_echoed,
+    checksum_integrity,
+    missing_content_length,
     unsupported_checksum_rejected,
+    newer_checksum_algorithms,
+    aws_defaults,
     conditional_delete,
     composite_checksum_without_part_count,
     concurrent_conditional_writes,

@@ -56,8 +56,6 @@ EXCLUDE=(
   minio-go:testListMultipartUpload
   # Browser POST uploads (PostObject) are not an in-scope operation.
   minio-go:testPresignedPostPolicy minio-go:testPresignedPostPolicyWrongFile
-  # Per-part checksums on GET partNumber are not kept (TODO/s3-api-gaps.md).
-  minio-go:testTrailingChecksums
   # Bucket versioning ExcludedPrefixes/ExcludeFolders are MinIO extensions.
   minio-go:testBucketVersioningExcludedPrefixes minio-py:test_set_get_bucket_versioning
   # GetObjectAttributes is not an in-scope operation (reached now that its versioned setup works).

@@ -239,6 +239,22 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// `create_dir_all` that also fsyncs each new directory into its parent, so a power
+/// loss cannot drop a directory holding a file a committed row names. Callers hold
+/// the commit lock, so an existing directory was synced by whoever created it; one
+/// whose sync fails is removed rather than left looking synced.
+fn create_dir_durable(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir.parent().expect("directory under the data dir");
+    create_dir_durable(parent)?;
+    std::fs::create_dir(dir)?;
+    sync_dir(parent).inspect_err(|_| {
+        let _ = std::fs::remove_dir(dir);
+    })
+}
+
 impl Inner {
     fn blob_path(&self, sha: &str) -> PathBuf {
         self.root
@@ -426,7 +442,7 @@ impl Tx<'_> {
 
     fn install(&self, blob: &mut FsBlob, dst: &Path) -> Result<()> {
         let dir = dst.parent().expect("blob path has a parent");
-        std::fs::create_dir_all(dir).map_err(StorageError::Io)?;
+        create_dir_durable(dir).map_err(StorageError::Io)?;
         std::fs::rename(&blob.tmp, dst).map_err(StorageError::Io)?;
         blob.armed = false;
         sync_dir(dir).map_err(StorageError::Io)
@@ -498,6 +514,8 @@ impl FsStorage {
         }
         let meta = data_dir.join("meta.redb");
         let db = Database::create(&meta).with_context(|| format!("opening {}", meta.display()))?;
+        // The entries just created; redb syncs its file but not its directory.
+        sync_dir(data_dir).with_context(|| format!("syncing {}", data_dir.display()))?;
         let crash_at = if cfg!(debug_assertions) {
             std::env::var(CRASH_ENV).ok()
         } else {

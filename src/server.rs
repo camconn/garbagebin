@@ -2,7 +2,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
@@ -14,12 +14,13 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
+use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
 use s3s::config::{S3Config, StaticConfigProvider};
 use s3s::host::SingleDomain;
 use s3s::region::Region;
 use s3s::service::{S3Service, S3ServiceBuilder};
-use s3s::{Body, S3Error, S3ErrorCode};
+use s3s::{Body, S3Error, S3ErrorCode, S3Result};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -139,6 +140,8 @@ async fn build<S: Storage>(
         builder.set_host(host);
     }
     let mut s3_config = S3Config::default();
+    // Keep the wire headers: a PUT without a length is refused, not read as empty.
+    s3_config.normalize_content_length = false;
     if config.strict_auth {
         builder.set_auth(SimpleAuth::from_single(
             config.access_key.clone(),
@@ -147,6 +150,7 @@ async fn build<S: Storage>(
         let region = Region::new(config.region.clone().into())
             .map_err(|e| anyhow::anyhow!("invalid region {:?}: {e}", config.region))?;
         s3_config.expected_region = Some(region);
+        builder.set_access(DeferredIntegrity);
     }
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
     Ok(builder.build())
@@ -211,15 +215,25 @@ async fn handle(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Body>,
             lenient::strip_auth(&mut req);
         }
         req.extensions_mut().insert(captured.clone());
+        // HTTP/2 frames bodies itself, so a missing Content-Length is no error there.
+        let version = req.version();
+        req.extensions_mut().insert(version);
         match verify_xml_body(&mut req).await {
             Err(e) => error_response(&e, &captured),
-            Ok(()) => match app.s3.call(req).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    warn!(error = %e, "internal error");
-                    error_response(&S3Error::new(S3ErrorCode::InternalError), &captured)
+            Ok(Some(e)) if app.lenient => error_response(&e, &captured),
+            Ok(pending) => {
+                if let Some(e) = pending {
+                    req.extensions_mut()
+                        .insert(IntegrityError(Arc::new(Mutex::new(Some(e)))));
                 }
-            },
+                match app.s3.call(req).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        warn!(error = %e, "internal error");
+                        error_response(&S3Error::new(S3ErrorCode::InternalError), &captured)
+                    }
+                }
+            }
         }
     };
 
@@ -267,31 +281,68 @@ async fn handle(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Body>,
     Ok(resp)
 }
 
-/// Subresources whose XML request bodies carry `Content-MD5` or `x-amz-checksum-*`.
+/// Subresources whose XML request bodies must carry `Content-MD5` or `x-amz-checksum-*`.
 /// s3s parses these bodies before the service sees them, so they are checked here.
 const CHECKSUMMED_XML: &[&str] = &[
     "delete",
     "tagging",
+    "versioning",
     "object-lock",
     "retention",
     "legal-hold",
 ];
 
-async fn verify_xml_body(req: &mut Request<Body>) -> Result<(), S3Error> {
-    let has_digest = |h: &http::HeaderMap| {
-        h.contains_key("content-md5") || h.keys().any(|k| k.as_str().starts_with("x-amz-checksum-"))
-    };
+/// An XML body's integrity error found before s3s authenticated the request. In strict
+/// mode it is reported only once the signature verifies, so a bad signature still gets 403.
+#[derive(Clone)]
+struct IntegrityError(Arc<Mutex<Option<S3Error>>>);
+
+struct DeferredIntegrity;
+
+#[async_trait::async_trait]
+impl S3Access for DeferredIntegrity {
+    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        // s3s's default check, which a custom one replaces.
+        if cx.credentials().is_none() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                "Signature is required",
+            ));
+        }
+        let pending = cx
+            .extensions_mut()
+            .get::<IntegrityError>()
+            .and_then(|e| e.0.lock().unwrap_or_else(PoisonError::into_inner).take());
+        pending.map_or(Ok(()), Err)
+    }
+}
+
+/// Buffers a checksummed XML body and checks its digest. `Err` if the declared body cannot be
+/// read, which is answered at once; `Ok(Some)` for a missing or wrong digest, which strict mode
+/// answers only after authentication.
+async fn verify_xml_body(req: &mut Request<Body>) -> Result<Option<S3Error>, S3Error> {
     let xml = req.uri().query().is_some_and(|q| {
         q.split('&')
             .any(|p| CHECKSUMMED_XML.contains(&p.split('=').next().unwrap_or_default()))
     });
-    if !(req.method() == Method::POST || req.method() == Method::PUT)
-        || !xml
-        || !has_digest(req.headers())
-    {
-        return Ok(());
+    if !(req.method() == Method::POST || req.method() == Method::PUT) || !xml {
+        return Ok(None);
+    }
+    if !checksum::has_digest(req.headers()) {
+        return Ok(Some(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        )));
     }
     let limit = S3Config::default().xml_max_body_size;
+    let declared = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
+    // Unframed or oversized: left unread for s3s, which refuses it after authenticating.
+    if declared.is_none_or(|n| n > limit) {
+        return Ok(None);
+    }
     let body = req.body_mut().store_all_limited(limit).await.map_err(|e| {
         if e.is::<s3s::BodySizeLimitExceeded>() {
             S3Error::with_message(
@@ -302,7 +353,9 @@ async fn verify_xml_body(req: &mut Request<Body>) -> Result<(), S3Error> {
             S3Error::with_message(S3ErrorCode::IncompleteBody, e.to_string())
         }
     })?;
-    checksum::verify_body(req.headers(), &body).map_err(service::digest_error)
+    Ok(checksum::verify_body(req.headers(), &body)
+        .err()
+        .map(service::digest_error))
 }
 
 /// An S3 error response built outside s3s; its body is rendered with the rest.

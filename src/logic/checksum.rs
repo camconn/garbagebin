@@ -16,6 +16,10 @@ use s3s::crypto::{self, Checksum as _};
 
 use crate::storage::{ByteStream, Checksums};
 
+/// What AWS computes for an upload that names no checksum, and combines across the parts of a
+/// multipart upload created without one.
+pub const DEFAULT: Algorithm = Algorithm::Crc64Nvme;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     Crc32,
@@ -23,15 +27,25 @@ pub enum Algorithm {
     Crc64Nvme,
     Sha1,
     Sha256,
+    Md5,
+    Sha512,
+    XxHash64,
+    XxHash3,
+    XxHash128,
 }
 
 impl Algorithm {
-    pub const ALL: [Algorithm; 5] = [
+    pub const ALL: [Algorithm; 10] = [
         Self::Crc32,
         Self::Crc32c,
         Self::Crc64Nvme,
         Self::Sha1,
         Self::Sha256,
+        Self::Md5,
+        Self::Sha512,
+        Self::XxHash64,
+        Self::XxHash3,
+        Self::XxHash128,
     ];
 
     /// From `x-amz-sdk-checksum-algorithm` style names (`CRC32`) or
@@ -51,6 +65,11 @@ impl Algorithm {
             Self::Crc64Nvme => "CRC64NVME",
             Self::Sha1 => "SHA1",
             Self::Sha256 => "SHA256",
+            Self::Md5 => "MD5",
+            Self::Sha512 => "SHA512",
+            Self::XxHash64 => "XXHASH64",
+            Self::XxHash3 => "XXHASH3",
+            Self::XxHash128 => "XXHASH128",
         }
     }
 
@@ -73,6 +92,11 @@ impl Algorithm {
             Self::Crc64Nvme => &mut c.crc64nvme,
             Self::Sha1 => &mut c.sha1,
             Self::Sha256 => &mut c.sha256,
+            Self::Md5 => &mut c.md5,
+            Self::Sha512 => &mut c.sha512,
+            Self::XxHash64 => &mut c.xxhash64,
+            Self::XxHash3 => &mut c.xxhash3,
+            Self::XxHash128 => &mut c.xxhash128,
         }
     }
 
@@ -83,6 +107,11 @@ impl Algorithm {
             Self::Crc64Nvme => &c.crc64nvme,
             Self::Sha1 => &c.sha1,
             Self::Sha256 => &c.sha256,
+            Self::Md5 => &c.md5,
+            Self::Sha512 => &c.sha512,
+            Self::XxHash64 => &c.xxhash64,
+            Self::XxHash3 => &c.xxhash3,
+            Self::XxHash128 => &c.xxhash128,
         }
     }
 
@@ -98,7 +127,7 @@ impl Algorithm {
             Self::Crc32 => Some((C::Crc32IsoHdlc, 4)),
             Self::Crc32c => Some((C::Crc32Iscsi, 4)),
             Self::Crc64Nvme => Some((C::Crc64Nvme, 8)),
-            Self::Sha1 | Self::Sha256 => None,
+            _ => None,
         }
     }
 
@@ -116,6 +145,11 @@ enum Hasher {
     Crc64Nvme(crypto::Crc64Nvme),
     Sha1(crypto::Sha1),
     Sha256(crypto::Sha256),
+    Md5(crypto::Md5),
+    Sha512(crypto::Sha512),
+    XxHash64(crypto::XxHash64),
+    XxHash3(crypto::XxHash3),
+    XxHash128(crypto::XxHash128),
 }
 
 impl Hasher {
@@ -126,6 +160,11 @@ impl Hasher {
             Algorithm::Crc64Nvme => Self::Crc64Nvme(crypto::Crc64Nvme::new()),
             Algorithm::Sha1 => Self::Sha1(crypto::Sha1::new()),
             Algorithm::Sha256 => Self::Sha256(crypto::Sha256::new()),
+            Algorithm::Md5 => Self::Md5(crypto::Md5::new()),
+            Algorithm::Sha512 => Self::Sha512(crypto::Sha512::new()),
+            Algorithm::XxHash64 => Self::XxHash64(crypto::XxHash64::new()),
+            Algorithm::XxHash3 => Self::XxHash3(crypto::XxHash3::new()),
+            Algorithm::XxHash128 => Self::XxHash128(crypto::XxHash128::new()),
         }
     }
 
@@ -136,6 +175,11 @@ impl Hasher {
             Self::Crc64Nvme(h) => h.update(data),
             Self::Sha1(h) => h.update(data),
             Self::Sha256(h) => h.update(data),
+            Self::Md5(h) => h.update(data),
+            Self::Sha512(h) => h.update(data),
+            Self::XxHash64(h) => h.update(data),
+            Self::XxHash3(h) => h.update(data),
+            Self::XxHash128(h) => h.update(data),
         }
     }
 
@@ -146,6 +190,11 @@ impl Hasher {
             Self::Crc64Nvme(h) => STANDARD.encode(h.finalize()),
             Self::Sha1(h) => STANDARD.encode(h.finalize()),
             Self::Sha256(h) => STANDARD.encode(h.finalize()),
+            Self::Md5(h) => STANDARD.encode(h.finalize()),
+            Self::Sha512(h) => STANDARD.encode(h.finalize()),
+            Self::XxHash64(h) => STANDARD.encode(h.finalize()),
+            Self::XxHash3(h) => STANDARD.encode(h.finalize()),
+            Self::XxHash128(h) => STANDARD.encode(h.finalize()),
         }
     }
 }
@@ -282,6 +331,23 @@ pub fn unsupported(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Whether a buffered body's request carries a digest to verify it against: `Content-MD5` or
+/// an `x-amz-checksum-*` value. An algorithm name alone is not one.
+pub fn has_digest(headers: &HeaderMap) -> bool {
+    headers.contains_key("content-md5")
+        || headers.keys().any(|k| {
+            k.as_str().starts_with("x-amz-checksum-") && Algorithm::parse(k.as_str()).is_some()
+        })
+}
+
+/// `algorithms`, or [`DEFAULT`] if it names none.
+pub fn or_default(mut algorithms: Vec<Algorithm>) -> Vec<Algorithm> {
+    if algorithms.is_empty() {
+        algorithms.push(DEFAULT);
+    }
+    algorithms
+}
+
 /// Adds checksum values delivered as aws-chunked trailers to `expected`.
 pub fn merge_trailers(expected: &mut Checksums, trailers: Option<&HeaderMap>) {
     let Some(trailers) = trailers else { return };
@@ -391,6 +457,18 @@ mod tests {
             Algorithm::Sha256.digest(data),
             "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek="
         );
+        // Python hashlib and xxhash, big-endian digests.
+        assert_eq!(Algorithm::Md5.digest(data), "XrY7u+Ae7tCTyyK7j1rNww==");
+        assert_eq!(
+            Algorithm::Sha512.digest(data),
+            "MJ7MSJwS1utMxA9QyQLytNDtd+5RGnx6m808qG1M2G+YndNbxf9JlnDaNCVbRbDP2DDoH2Bdz33FVC6TrpzXbw=="
+        );
+        assert_eq!(Algorithm::XxHash64.digest(data), "RatnNLIeaWg=");
+        assert_eq!(Algorithm::XxHash3.digest(data), "1Eex6kDmmIs=");
+        assert_eq!(
+            Algorithm::XxHash128.digest(data),
+            "340J6T+HSQCpm4d1zBW2xw=="
+        );
     }
 
     #[test]
@@ -401,7 +479,9 @@ mod tests {
             Some(Algorithm::Crc32c)
         );
         assert_eq!(Algorithm::parse(" sha256"), Some(Algorithm::Sha256));
-        assert_eq!(Algorithm::parse("md5"), None);
+        assert_eq!(Algorithm::parse("md5"), Some(Algorithm::Md5));
+        assert_eq!(Algorithm::parse("XXHASH3"), Some(Algorithm::XxHash3));
+        assert_eq!(Algorithm::parse("blake3"), None);
     }
 
     #[test]
@@ -423,17 +503,18 @@ mod tests {
             ]),
             None
         );
+        assert_eq!(h(&[("x-amz-checksum-sha512", "x")]), None);
         assert_eq!(
-            h(&[("x-amz-checksum-md5", "x")]).as_deref(),
-            Some("x-amz-checksum-md5")
+            h(&[("x-amz-checksum-blake3", "x")]).as_deref(),
+            Some("x-amz-checksum-blake3")
         );
         assert_eq!(
-            h(&[("x-amz-checksum-algorithm", "MD5")]).as_deref(),
-            Some("MD5")
+            h(&[("x-amz-checksum-algorithm", "BLAKE3")]).as_deref(),
+            Some("BLAKE3")
         );
         assert_eq!(
-            h(&[("x-amz-trailer", "x-amz-checksum-sha512")]).as_deref(),
-            Some("x-amz-checksum-sha512")
+            h(&[("x-amz-trailer", "x-amz-checksum-blake3")]).as_deref(),
+            Some("x-amz-checksum-blake3")
         );
     }
 

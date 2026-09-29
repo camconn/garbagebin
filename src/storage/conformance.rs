@@ -297,13 +297,12 @@ pub async fn meta_round_trip<S: Storage>(s: S) {
         tags: Tags::from([("t".into(), "v".into())]),
         checksums: Checksums {
             crc32: Some("AAAAAA==".into()),
-            crc32c: None,
-            crc64nvme: None,
-            sha1: None,
             sha256: Some("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".into()),
             checksum_type: Some("FULL_OBJECT".into()),
+            ..Default::default()
         },
         part_sizes: vec![2, 1],
+        part_checksums: vec!["AAAAAA==".into(), "AAAAAB==".into()],
         upload_id: Some("u".into()),
         sse: Sse {
             algorithm: Some("aws:kms".into()),

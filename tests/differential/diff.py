@@ -7,8 +7,10 @@
 
 import argparse
 import base64
+import datetime
 import difflib
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -16,16 +18,19 @@ import re
 import sys
 import uuid
 import xml.etree.ElementTree as ET
+import zlib
 from pathlib import Path
-from urllib.parse import quote
+from types import SimpleNamespace
+from urllib.parse import quote, urlsplit
 
 import boto3
 import requests
-from botocore.auth import S3SigV4Auth
+from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth
 from botocore.awsrequest import AWSRequest
 from botocore.config import Config
 from botocore.credentials import Credentials
 from botocore.exceptions import BotoCoreError, ClientError
+from requests.structures import CaseInsensitiveDict
 
 HERE = Path(__file__).parent
 
@@ -60,6 +65,13 @@ BLANK_TAGS = {
     "Message",
 }
 VAR = re.compile(r"\{([a-z0-9_]+)\}")
+# Buckets under the prefix older than this are left over from a killed run.
+STALE_AFTER = datetime.timedelta(hours=1)
+TRAILER_DIGESTS = {
+    "crc32": lambda b: zlib.crc32(b).to_bytes(4, "big"),
+    "sha1": lambda b: hashlib.sha1(b).digest(),
+    "sha256": lambda b: hashlib.sha256(b).digest(),
+}
 
 
 class Target:
@@ -74,24 +86,49 @@ class Target:
 
     def send(self, step):
         bucket = self.sub(step.get("bucket", "{bucket}"))
-        path = "/" + quote(bucket, safe="")
-        if "key" in step:
-            path += "/" + quote(self.sub(step["key"]), safe="/~")
+        key = "/" + quote(self.sub(step["key"]), safe="/~") if "key" in step else ""
         query = "&".join(
             quote(k, safe="") + ("=" + quote(self.sub(str(v)), safe="~") if v != "" else "")
             for k, v in step.get("query", {}).items()
         )
-        url = self.endpoint + path + ("?" + query if query else "")
+        if step.get("vhost"):
+            u = urlsplit(self.endpoint)
+            url = f"{u.scheme}://{quote(bucket, safe='')}.{u.netloc}{key or '/'}"
+        else:
+            url = self.endpoint + "/" + quote(bucket, safe="") + key
+        url += "?" + query if query else ""
         body = make_body(step.get("body"), self.sub)
+        create_bucket = step["method"] == "PUT" and not key and not query and "body" not in step
+        if create_bucket and self.region != "us-east-1":
+            body = (
+                "<CreateBucketConfiguration><LocationConstraint>"
+                f"{self.region}</LocationConstraint></CreateBucketConfiguration>"
+            ).encode()
         headers = {k: self.sub(v) for k, v in step.get("headers", {}).items()}
         headers["Accept-Encoding"] = "identity"
         if step.get("content_md5"):
             headers["Content-MD5"] = base64.b64encode(hashlib.md5(body).digest()).decode()
-        req = AWSRequest(method=step["method"], url=url, data=body, headers=headers)
-        S3SigV4Auth(self.creds, "s3", self.region).add_auth(req)
-        resp = self.http.request(
-            step["method"], url, headers=dict(req.headers.items()), data=body, allow_redirects=False, timeout=120
-        )
+        # A presigned URL does not cover the body, and botocore's query signer would try to parse it.
+        req = AWSRequest(method=step["method"], url=url, data={} if "presign" in step else body, headers=headers)
+        if "aws_chunked" in step:
+            body = aws_chunked(req, body, step["aws_chunked"])
+        if "presign" in step:
+            S3SigV4QueryAuth(self.creds, "s3", self.region, expires=step["presign"].get("expires", 300)).add_auth(req)
+            if step["presign"].get("tamper"):
+                req.url = re.sub(r"(X-Amz-Signature=)(.)", lambda m: m.group(1) + "10"[m.group(2) == "1"], req.url)
+        else:
+            S3SigV4Auth(self.creds, "s3", self.region).add_auth(req)
+        if step.get("no_length"):
+            resp = send_unframed(step["method"], req.url, dict(req.headers.items()))
+        else:
+            resp = self.http.request(
+                step["method"],
+                req.url,
+                headers=dict(req.headers.items()),
+                data=body,
+                allow_redirects=False,
+                timeout=120,
+            )
         for var, spec in step.get("capture", {}).items():
             if "header" in spec:
                 self.vars[var] = resp.headers.get(spec["header"], "")
@@ -111,19 +148,34 @@ class Target:
             config=Config(s3={"addressing_style": "path"}),
         )
 
-    def cleanup(self):
+    def cleanup(self, bucket=None):
+        bucket = bucket or self.bucket
         try:
             s3 = self.s3()
-            for up in s3.list_multipart_uploads(Bucket=self.bucket).get("Uploads", []):
-                s3.abort_multipart_upload(Bucket=self.bucket, Key=up["Key"], UploadId=up["UploadId"])
-            for page in s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket):
-                keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-                if keys:
-                    s3.delete_objects(Bucket=self.bucket, Delete={"Objects": keys, "Quiet": True})
-            s3.delete_bucket(Bucket=self.bucket)
+            for up in s3.list_multipart_uploads(Bucket=bucket).get("Uploads", []):
+                s3.abort_multipart_upload(Bucket=bucket, Key=up["Key"], UploadId=up["UploadId"])
+            for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
+                versions = page.get("Versions", []) + page.get("DeleteMarkers", [])
+                objs = [{"Key": v["Key"], "VersionId": v["VersionId"]} for v in versions]
+                if objs:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": objs, "Quiet": True})
+            s3.delete_bucket(Bucket=bucket)
         except (BotoCoreError, ClientError) as e:
             if "NoSuchBucket" not in str(e):
-                print(f"cleanup {self.name}: {e}", file=sys.stderr)
+                print(f"cleanup {self.name} {bucket}: {e}", file=sys.stderr)
+
+    def sweep(self, prefix):
+        """Deletes buckets leaked by earlier runs that were killed before cleanup."""
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - STALE_AFTER
+        try:
+            buckets = self.s3().list_buckets(Prefix=prefix + "-").get("Buckets", [])
+        except (BotoCoreError, ClientError) as e:
+            print(f"sweep {self.name}: {e}", file=sys.stderr)
+            return
+        for b in buckets:
+            if b["CreationDate"] < cutoff:
+                print(f"sweep {self.name}: deleting stale bucket {b['Name']}")
+                self.cleanup(b["Name"])
 
 
 def make_body(spec, sub):
@@ -132,6 +184,35 @@ def make_body(spec, sub):
     if isinstance(spec, str):
         return sub(spec).encode()
     return random.Random(spec.get("seed", 0)).randbytes(spec["random"])
+
+
+def send_unframed(method, url, headers):
+    """Sends a request with neither Content-Length nor Transfer-Encoding, which requests always adds."""
+    u = urlsplit(url)
+    conn = (http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection)(u.netloc, timeout=120)
+    conn.putrequest(method, u.path + ("?" + u.query if u.query else ""), skip_accept_encoding=True)
+    for k, v in headers.items():
+        conn.putheader(k, v)
+    conn.endheaders()
+    r = conn.getresponse()
+    resp = SimpleNamespace(status_code=r.status, headers=CaseInsensitiveDict(r.getheaders()), content=r.read())
+    conn.close()
+    return resp
+
+
+def aws_chunked(req, body, algorithm):
+    """Frames `body` as an unsigned aws-chunked upload with a trailing checksum, as SDKs send by default."""
+    header = f"x-amz-checksum-{algorithm}"
+    digest = base64.b64encode(TRAILER_DIGESTS[algorithm](body)).decode()
+    req.headers["Content-Encoding"] = "aws-chunked"
+    req.headers["x-amz-decoded-content-length"] = str(len(body))
+    req.headers["x-amz-trailer"] = header
+    # Makes botocore sign with STREAMING-UNSIGNED-PAYLOAD-TRAILER.
+    req.context["checksum"] = {"request_algorithm": {"in": "trailer", "name": header}}
+    chunk = f"{len(body):x}\r\n".encode() + body + b"\r\n" if body else b""
+    framed = chunk + f"0\r\n{header}:{digest}\r\n\r\n".encode()
+    req.data = framed
+    return framed
 
 
 def strip_ns(tag):
@@ -169,7 +250,8 @@ def normalize(resp, target, ignore_headers, ignore_xml):
         if h in resp.headers:
             lines.append(f"header {h}: {fix(resp.headers[h])}")
     for h, v in sorted(resp.headers.items()):
-        if h.lower().startswith("x-amz-meta-") and h.lower() not in ignore_headers:
+        prefixes = ("x-amz-meta-", "x-amz-checksum-", "x-amz-server-side-encryption")
+        if h.lower().startswith(prefixes) and h.lower() not in ignore_headers:
             lines.append(f"header {h.lower()}: {v}")
     for h in PRESENCE_HEADERS:
         if h in resp.headers and h not in ignore_headers:
@@ -183,7 +265,9 @@ def normalize(resp, target, ignore_headers, ignore_xml):
             text = (el.text or "").strip()
             if text and tag in BLANK_TAGS:
                 text = "<present>"
-            lines.append("  " * depth + tag + (f": {fix(text)}" if text else ""))
+            # Attributes keep their namespace ({uri}name) so xsi:type and friends stay distinct.
+            attrs = "".join(f" @{k}={fix(v)}" for k, v in sorted(el.attrib.items()))
+            lines.append("  " * depth + tag + attrs + (f": {fix(text)}" if text else ""))
             for child in el:
                 walk(child, depth + 1)
 
@@ -221,18 +305,27 @@ def target_from_env(side, prefix):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("scenario", nargs="?", default=str(HERE / "scenarios" / "basic.json"))
+    ap.add_argument("scenarios", nargs="*", help="scenario files (default: all in scenarios/)")
     ap.add_argument("-v", "--verbose", action="store_true", help="print normalized responses for every step")
     args = ap.parse_args()
 
-    scenario = json.loads(Path(args.scenario).read_text())
+    paths = args.scenarios or sorted(str(p) for p in (HERE / "scenarios").glob("*.json"))
     prefix = os.environ.get("DIFF_BUCKET_PREFIX", "gb-diff")
-    a, b = target_from_env("A", prefix), target_from_env("B", prefix)
+    a = target_from_env("A", prefix)
     if not a.creds.access_key:
         sys.exit("side A needs credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or DIFF_A_*")
+    a.sweep(prefix)
+    diffs = sum(run(json.loads(Path(p).read_text()), Path(p).stem, prefix, args.verbose) for p in paths)
+    print(f"{diffs} step(s) differ" if diffs else "no differences")
+    sys.exit(1 if diffs else 0)
+
+
+def run(scenario, label, prefix, verbose):
+    """Replays one scenario on fresh buckets; returns the number of differing steps."""
+    print(f"== {label}")
+    a, b = target_from_env("A", prefix), target_from_env("B", prefix)
     ignore_h = {h.lower() for h in scenario.get("ignore_headers", [])}
     ignore_x = set(scenario.get("ignore_xml", []))
-
     diffs = 0
     try:
         for step in scenario["steps"]:
@@ -243,7 +336,7 @@ def main():
             lb = normalize(b.send(step), b, sh, sx)
             if la == lb:
                 print(f"ok    {name}")
-                if args.verbose:
+                if verbose:
                     print("\n".join("      " + line for line in la))
             else:
                 diffs += 1
@@ -253,8 +346,7 @@ def main():
     finally:
         a.cleanup()
         b.cleanup()
-    print(f"{diffs} step(s) differ" if diffs else "no differences")
-    sys.exit(1 if diffs else 0)
+    return diffs
 
 
 if __name__ == "__main__":

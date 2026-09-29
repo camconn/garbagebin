@@ -3,8 +3,8 @@
 A single-process, S3-compatible object store that runs as one Docker container for local development and
 integration tests. Unmodified AWS SDKs work against it with only an endpoint override.
 
-Package `garbagebin`, binary `gb`. See [TASKS.md](TASKS.md) for status and the [design doc](docs/design.md)
-for rationale.
+Package `garbagebin`, binary `gb`. See the [design doc](docs/design.md) for rationale and [TODO/](TODO/) for deferred
+work.
 
 ## Usage
 
@@ -101,7 +101,7 @@ docker build -t garbagebin .
 | `scripts/smoke.sh [--backend memory\|fs] [sdk...]` | SDK smoke tests in [tests/smoke/](tests/smoke/) (boto3, aws-sdk-go-v2, aws-sdk-js v3, aws-sdk-java v2, AWS CLI, rclone), in parallel. Builds and starts `gb` on a free port unless `S3_ENDPOINT` is set. The merge gate. |
 | `scripts/s3-tests.sh` | Ceph s3-tests against `S3_ENDPOINT`; failures must be listed in [tests/s3-tests/allowlist.txt](tests/s3-tests/allowlist.txt), which can only shrink |
 | `scripts/mint.sh` | MinIO mint (Docker) against `S3_ENDPOINT` |
-| `uv run tests/differential/diff.py [-v] [scenario.json]` | Replays [tests/differential/scenarios/](tests/differential/scenarios/) against side A (real S3, using `AWS_*` credentials) and side B (`DIFF_B_ENDPOINT`, default `http://localhost:9000`) and diffs the responses, ignoring request ids and dates. `DIFF_A_ENDPOINT` points side A at another server instead |
+| `uv run tests/differential/diff.py [-v] [scenario.json...]` | Replays the scenarios in [tests/differential/scenarios/](tests/differential/scenarios/) (all by default) against side A (real S3, using `AWS_*` credentials) and side B (`DIFF_B_ENDPOINT`, default `http://localhost:9000`) and diffs the responses, ignoring request ids and dates. `DIFF_A_ENDPOINT` points side A at another server instead. Run side B with strict auth (the scenarios include bad signatures) and `S3_VHOST_DOMAIN` set to its endpoint's host, e.g. `localhost` (steps with `"vhost": true` address `<bucket>.<endpoint host>`). `DIFF_A_REGION`/`DIFF_B_REGION` pick each side's region; outside `us-east-1`, CreateBucket sends a `LocationConstraint`. Side A's stale `gb-diff-*` buckets (older than `STALE_AFTER`) are deleted first, as left over from a killed run |
 | `go test ./...`, `uv run pytest`, `npm ci && npm test`, `./gradlew test` | Testcontainers module tests, run in each `testcontainers/<lang>/` directory against the local `garbagebin` image (`GB_TEST_IMAGE` overrides) |
 
 `s3-tests.sh` and `mint.sh` need a running server (e.g. `target/release/gb`); `mint.sh` also needs Docker.
@@ -109,8 +109,8 @@ Smoke tests need uv, Go, Node, Java, the AWS CLI v2 and rclone. Every script rea
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (default `test`/`test`), so they also run against any other
 S3 endpoint. CI runs fmt, clippy, tests and smoke tests on every push ([ci.yml](.github/workflows/ci.yml)),
 conformance suites on push and PR ([conformance.yml](.github/workflows/conformance.yml)), and the
-differential tests, multi-arch image build and Testcontainers module tests nightly
-([nightly.yml](.github/workflows/nightly.yml)).
+multi-arch image build and Testcontainers module tests on merge to `master`
+([merge.yml](.github/workflows/merge.yml)). The differential tests are run by hand.
 
 ## License
 

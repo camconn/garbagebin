@@ -2,16 +2,16 @@ use s3s::dto::{
     self, ChecksumMode, ChecksumType, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
     CopySource, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
     DeletedObject, ETagCondition, GetObjectInput, GetObjectOutput, HeadObjectInput,
-    HeadObjectOutput, MetadataDirective, PutObjectInput, PutObjectOutput, ServerSideEncryption,
-    StorageClass, StreamingBlob, TaggingDirective,
+    HeadObjectOutput, MetadataDirective, PutObjectInput, PutObjectOutput, StorageClass,
+    StreamingBlob, TaggingDirective,
 };
 use s3s::{S3ErrorCode, S3Request, S3Response, S3Result};
 
 use super::{
     DEFAULT_CONTENT_TYPE, GarbageBin, Trailers, Upload, algorithm, check_conditions, check_key,
-    content_encoding, error, etag, etag_matches, expected_checksums, full_object, lock,
-    new_version_id, now, parse_tagging_header, precondition_failed, read_err, storage_class,
-    storage_err, ts, version_param, write_version, written_version,
+    checksums_of, content_encoding, error, etag, etag_matches, full_object, lock, new_version_id,
+    now, parse_tagging_header, precondition_failed, read_err, require_length, set_checksums,
+    sse_header, storage_class, storage_err, ts, version_param, write_version, written_version,
 };
 use futures::TryStreamExt;
 
@@ -26,6 +26,7 @@ pub async fn put_object<S: Storage>(
     gb: &GarbageBin<S>,
     req: S3Request<PutObjectInput>,
 ) -> S3Result<S3Response<PutObjectOutput>> {
+    require_length(&req)?;
     let trailers = Trailers::of(&req);
     let input = req.input;
     check_key(&input.key)?;
@@ -50,18 +51,13 @@ pub async fn put_object<S: Storage>(
     )
     .await?;
 
-    let expected = expected_checksums(
-        input.checksum_crc32,
-        input.checksum_crc32c,
-        input.checksum_crc64nvme,
-        input.checksum_sha1,
-        input.checksum_sha256,
-    );
+    let expected = checksums_of!(input);
     let upload = Upload {
         headers: &req.headers,
         trailers,
         expected,
         sdk_algorithm: algorithm(input.checksum_algorithm.as_ref()),
+        always_default: false,
     };
     let (blob, digests) = gb.stage(input.body, upload).await?;
 
@@ -92,6 +88,7 @@ pub async fn put_object<S: Storage>(
         tags,
         checksums: full_object(digests.checksums),
         part_sizes: Vec::new(),
+        part_checksums: Vec::new(),
         upload_id: None,
         sse,
         storage_class,
@@ -103,28 +100,24 @@ pub async fn put_object<S: Storage>(
         .await
         .map_err(storage_err)?;
 
-    let c = &meta.checksums;
-    Ok(S3Response::new(PutObjectOutput {
+    let mut out = PutObjectOutput {
         e_tag: Some(etag(&meta)),
-        checksum_crc32: c.crc32.clone(),
-        checksum_crc32c: c.crc32c.clone(),
-        checksum_crc64nvme: c.crc64nvme.clone(),
-        checksum_sha1: c.sha1.clone(),
-        checksum_sha256: c.sha256.clone(),
-        checksum_type: c.checksum_type.clone().map(ChecksumType::from),
-        server_side_encryption: meta.sse.algorithm.clone().map(ServerSideEncryption::from),
+        checksum_type: meta.checksums.checksum_type.clone().map(ChecksumType::from),
+        server_side_encryption: sse_header(&meta.sse),
         ssekms_key_id: meta.sse.kms_key_id.clone(),
         sse_customer_algorithm: meta.sse.customer_algorithm.clone(),
         sse_customer_key_md5: meta.sse.customer_key_md5.clone(),
         bucket_key_enabled: meta.sse.bucket_key_enabled,
         version_id: written_version(&meta),
         ..Default::default()
-    }))
+    };
+    set_checksums!(out, &meta.checksums);
+    Ok(S3Response::new(out))
 }
 
 /// Fills the headers GET and HEAD share from the metadata row.
 macro_rules! object_headers {
-    ($out:ident, $meta:expr, $with_checksums:expr) => {{
+    ($out:ident, $meta:expr, $checksums:expr) => {{
         let m: &ObjectMeta = $meta;
         $out.accept_ranges = Some("bytes".to_owned());
         $out.e_tag = Some(etag(m));
@@ -139,7 +132,7 @@ macro_rules! object_headers {
             (!m.user_metadata.is_empty()).then(|| m.user_metadata.clone().into_iter().collect());
         $out.parts_count = (!m.part_sizes.is_empty()).then(|| m.part_sizes.len() as i32);
         $out.tag_count = (!m.tags.is_empty()).then(|| m.tags.len() as i32);
-        $out.server_side_encryption = m.sse.algorithm.clone().map(ServerSideEncryption::from);
+        $out.server_side_encryption = sse_header(&m.sse);
         $out.ssekms_key_id = m.sse.kms_key_id.clone();
         $out.sse_customer_algorithm = m.sse.customer_algorithm.clone();
         $out.sse_customer_key_md5 = m.sse.customer_key_md5.clone();
@@ -150,14 +143,9 @@ macro_rules! object_headers {
             $out.object_lock_retain_until_date,
             $out.object_lock_legal_hold_status,
         ) = lock::headers(m);
-        if $with_checksums {
-            let c = &m.checksums;
-            $out.checksum_crc32 = c.crc32.clone();
-            $out.checksum_crc32c = c.crc32c.clone();
-            $out.checksum_crc64nvme = c.crc64nvme.clone();
-            $out.checksum_sha1 = c.sha1.clone();
-            $out.checksum_sha256 = c.sha256.clone();
-            $out.checksum_type = c.checksum_type.clone().map(ChecksumType::from);
+        if let Some(c) = $checksums {
+            set_checksums!($out, &c);
+            $out.checksum_type = c.checksum_type.map(ChecksumType::from);
         }
     }};
 }
@@ -168,6 +156,33 @@ fn checksum_mode(mode: Option<&ChecksumMode>) -> bool {
 
 fn content_range(r: &std::ops::Range<u64>, size: u64) -> String {
     format!("bytes {}-{}/{size}", r.start, r.end - 1)
+}
+
+/// Checksums a GET/HEAD reports in checksum mode: the object's, or one part's for
+/// `partNumber`; none for a `Range`. Call after [`read_span`] has validated the request.
+fn read_checksums(
+    meta: &ObjectMeta,
+    range: Option<&dto::Range>,
+    part_number: Option<i32>,
+) -> Option<Checksums> {
+    if range.is_some() {
+        return None;
+    }
+    let Some(n) = part_number.filter(|_| !meta.part_sizes.is_empty()) else {
+        return Some(meta.checksums.clone());
+    };
+    let a = Algorithm::ALL
+        .into_iter()
+        .find(|a| a.get(&meta.checksums).is_some())?;
+    let v = meta
+        .part_checksums
+        .get(usize::try_from(n).ok()?.checked_sub(1)?)?;
+    let mut c = Checksums {
+        checksum_type: meta.checksums.checksum_type.clone(),
+        ..Default::default()
+    };
+    a.set(&mut c, Some(v.clone()));
+    Some(c)
 }
 
 /// The byte range a GET/HEAD asks for via `Range` or `partNumber`; `None` for the whole object.
@@ -247,11 +262,13 @@ pub async fn get_object<S: Storage>(
         i.if_unmodified_since.as_ref(),
     )?;
     let range = read_span(&meta, i.range.as_ref(), i.part_number)?;
-    let full = range.is_none();
     let span = range.clone().unwrap_or(0..meta.size);
+    let checksums = checksum_mode(i.checksum_mode.as_ref())
+        .then(|| read_checksums(&meta, i.range.as_ref(), i.part_number))
+        .flatten();
 
     let mut out = GetObjectOutput::default();
-    object_headers!(out, &meta, full && checksum_mode(i.checksum_mode.as_ref()));
+    object_headers!(out, &meta, checksums);
     out.content_length = Some((span.end - span.start) as i64);
     out.content_range = range.as_ref().map(|r| content_range(r, meta.size));
     out.version_id = gb.version_header(&i.bucket, &meta).await?;
@@ -279,13 +296,12 @@ pub async fn head_object<S: Storage>(
     )?;
     let range = read_span(&meta, i.range.as_ref(), i.part_number)?;
     let span = range.clone().unwrap_or(0..meta.size);
+    let checksums = checksum_mode(i.checksum_mode.as_ref())
+        .then(|| read_checksums(&meta, i.range.as_ref(), i.part_number))
+        .flatten();
 
     let mut out = HeadObjectOutput::default();
-    object_headers!(
-        out,
-        &meta,
-        range.is_none() && checksum_mode(i.checksum_mode.as_ref())
-    );
+    object_headers!(out, &meta, checksums);
     out.content_length = Some((span.end - span.start) as i64);
     out.content_range = range.as_ref().map(|r| content_range(r, meta.size));
     out.version_id = gb.version_header(&i.bucket, &meta).await?;
@@ -473,6 +489,7 @@ async fn single_part<S: Storage>(
         .filter(|a| a.get(&src.checksums).is_some())
         .chain(requested)
         .collect();
+    let algorithms = checksum::or_default(algorithms);
     let (stream, handle) = checksum::hashing(reader.read(0..src.size), &algorithms);
     stream
         .try_for_each(|_| futures::future::ok(()))
@@ -481,6 +498,7 @@ async fn single_part<S: Storage>(
     let digests = handle.finish();
     meta.etag = etag_fmt::single(&digests.md5);
     meta.part_sizes = Vec::new();
+    meta.part_checksums = Vec::new();
     meta.checksums = full_object(digests.checksums);
     Ok(())
 }
@@ -601,21 +619,16 @@ pub async fn copy_object<S: Storage>(
         .await
         .map_err(storage_err)?;
 
-    let c: &Checksums = &meta.checksums;
-    let result = CopyObjectResult {
+    let mut result = CopyObjectResult {
         e_tag: Some(etag(&meta)),
         last_modified: Some(ts(meta.last_modified)),
-        checksum_crc32: c.crc32.clone(),
-        checksum_crc32c: c.crc32c.clone(),
-        checksum_crc64nvme: c.crc64nvme.clone(),
-        checksum_sha1: c.sha1.clone(),
-        checksum_sha256: c.sha256.clone(),
-        checksum_type: c.checksum_type.clone().map(ChecksumType::from),
+        checksum_type: meta.checksums.checksum_type.clone().map(ChecksumType::from),
         ..Default::default()
     };
+    set_checksums!(result, &meta.checksums);
     Ok(S3Response::new(CopyObjectOutput {
         copy_object_result: Some(result),
-        server_side_encryption: meta.sse.algorithm.clone().map(ServerSideEncryption::from),
+        server_side_encryption: sse_header(&meta.sse),
         ssekms_key_id: meta.sse.kms_key_id.clone(),
         sse_customer_algorithm: meta.sse.customer_algorithm.clone(),
         sse_customer_key_md5: meta.sse.customer_key_md5.clone(),

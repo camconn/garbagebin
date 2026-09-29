@@ -353,3 +353,12 @@ async fn loads_rows_from_before_versioning() {
     s.delete_version("b", "k", NULL_VERSION).await.unwrap();
     assert!(files(&dir.path().join("blobs")).is_empty());
 }
+
+#[test]
+fn durable_dirs() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("blobs/ab/cd");
+    super::create_dir_durable(&dir).unwrap();
+    assert!(dir.is_dir());
+    super::create_dir_durable(&dir).unwrap();
+}

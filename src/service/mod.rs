@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
 use http::HeaderMap;
+use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use s3s::dto::{ETag, ETagCondition, Owner, StreamingBlob, Timestamp};
 use s3s::stream::aws_chunked_stream::AwsChunkedStreamError;
 use s3s::stream::upload_stream::UploadStreamError;
@@ -26,7 +27,7 @@ use crate::lenient;
 use crate::logic::checksum::{self, Algorithm, BodyError, Digests};
 use crate::logic::validate;
 use crate::storage::{
-    BucketInfo, ByteStream, Checksums, NULL_VERSION, ObjectMeta, Storage, StorageError, Tags,
+    BucketInfo, ByteStream, Checksums, NULL_VERSION, ObjectMeta, Sse, Storage, StorageError, Tags,
     Versioning, WriteCheck,
 };
 
@@ -61,7 +62,11 @@ impl<S: Storage> GarbageBin<S> {
     ) -> S3Result<(S::Blob, Digests)> {
         check_checksum_support(upload.headers)?;
         let mut expected = upload.expected;
-        let algorithms = checksum::requested(&expected, upload.sdk_algorithm, upload.headers);
+        let mut algorithms = checksum::requested(&expected, upload.sdk_algorithm, upload.headers);
+        if upload.always_default {
+            algorithms.push(checksum::DEFAULT);
+        }
+        let algorithms = checksum::or_default(algorithms);
         let (stream, handle) = checksum::hashing(body_stream(body), &algorithms);
         let blob = self.storage.write_blob(stream).await.map_err(storage_err)?;
         let digests = handle.finish();
@@ -177,6 +182,9 @@ struct Upload<'a> {
     trailers: Option<Trailers>,
     expected: Checksums,
     sdk_algorithm: Option<&'a str>,
+    /// Compute [`checksum::DEFAULT`] even when the request names another checksum: a part of
+    /// an upload created without one, so Complete can combine it.
+    always_default: bool,
 }
 
 /// Trailing headers from either s3s (strict) or the lenient decoder.
@@ -209,6 +217,33 @@ fn body_stream(body: Option<StreamingBlob>) -> ByteStream {
         Some(b) => Box::pin(b.map_err(io::Error::other)),
         None => Box::pin(futures::stream::empty()),
     }
+}
+
+/// A body with no declared length reads as empty; AWS refuses it rather than store that.
+fn require_length<T>(req: &S3Request<T>) -> S3Result<()> {
+    let h = &req.headers;
+    let framed = req.extensions.get::<http::Version>() == Some(&http::Version::HTTP_2);
+    if framed || h.contains_key(CONTENT_LENGTH) || h.contains_key(TRANSFER_ENCODING) {
+        return Ok(());
+    }
+    // Lenient aws-chunked: the decoder dropped the framed Content-Length.
+    let msg = if req.extensions.get::<lenient::Trailers>().is_some() {
+        "missing header: x-amz-decoded-content-length"
+    } else {
+        "You must provide the Content-Length HTTP header."
+    };
+    Err(error(S3ErrorCode::MissingContentLength, msg))
+}
+
+/// `x-amz-server-side-encryption` for a stored object. AWS encrypts everything with SSE-S3
+/// unless told otherwise, so that is reported (though nothing is encrypted) except for SSE-C.
+fn sse_header(sse: &Sse) -> Option<s3s::dto::ServerSideEncryption> {
+    let algorithm = match &sse.algorithm {
+        Some(a) => a.as_str(),
+        None if sse.customer_algorithm.is_some() => return None,
+        None => s3s::dto::ServerSideEncryption::AES256,
+    };
+    Some(algorithm.to_owned().into())
 }
 
 pub(crate) fn error(code: S3ErrorCode, msg: impl Into<String>) -> S3Error {
@@ -539,22 +574,43 @@ fn algorithm(a: Option<&s3s::dto::ChecksumAlgorithm>) -> Option<&str> {
     a.map(|a| a.as_str())
 }
 
-fn expected_checksums(
-    crc32: Option<String>,
-    crc32c: Option<String>,
-    crc64nvme: Option<String>,
-    sha1: Option<String>,
-    sha256: Option<String>,
-) -> Checksums {
-    Checksums {
-        crc32,
-        crc32c,
-        crc64nvme,
-        sha1,
-        sha256,
-        checksum_type: None,
-    }
+/// Checksum values from the `checksum_*` fields of an s3s input or part.
+macro_rules! checksums_of {
+    ($x:expr) => {
+        $crate::storage::Checksums {
+            crc32: $x.checksum_crc32,
+            crc32c: $x.checksum_crc32c,
+            crc64nvme: $x.checksum_crc64nvme,
+            sha1: $x.checksum_sha1,
+            sha256: $x.checksum_sha256,
+            md5: $x.checksum_md5,
+            sha512: $x.checksum_sha512,
+            xxhash64: $x.checksum_xxhash64,
+            xxhash3: $x.checksum_xxhash3,
+            xxhash128: $x.checksum_xxhash128,
+            checksum_type: None,
+        }
+    };
 }
+pub(crate) use checksums_of;
+
+/// Copies stored checksums (not the type) into the `checksum_*` fields of an s3s output.
+macro_rules! set_checksums {
+    ($out:expr, $c:expr) => {{
+        let c: &$crate::storage::Checksums = $c;
+        $out.checksum_crc32 = c.crc32.clone();
+        $out.checksum_crc32c = c.crc32c.clone();
+        $out.checksum_crc64nvme = c.crc64nvme.clone();
+        $out.checksum_sha1 = c.sha1.clone();
+        $out.checksum_sha256 = c.sha256.clone();
+        $out.checksum_md5 = c.md5.clone();
+        $out.checksum_sha512 = c.sha512.clone();
+        $out.checksum_xxhash64 = c.xxhash64.clone();
+        $out.checksum_xxhash3 = c.xxhash3.clone();
+        $out.checksum_xxhash128 = c.xxhash128.clone();
+    }};
+}
+pub(crate) use set_checksums;
 
 /// Stored checksums of a fresh single-part upload.
 fn full_object(mut c: Checksums) -> Checksums {

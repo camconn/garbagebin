@@ -3,17 +3,18 @@ use s3s::dto::{
     CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart,
     CopyPartResult, CreateMultipartUploadInput, CreateMultipartUploadOutput, EncodingType,
     Initiator, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput,
-    ListPartsOutput, MultipartUpload, Part, ServerSideEncryption, StorageClass,
-    UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    ListPartsOutput, MultipartUpload, Part, StorageClass, UploadPartCopyInput,
+    UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3ErrorCode, S3Request, S3Response, S3Result};
 
 use super::object::{copy_source, copy_source_err};
 use super::{
     DEFAULT_CONTENT_TYPE, GarbageBin, Trailers, Upload, algorithm, check_checksum_support,
-    check_conditions, check_key, check_write_conditions, content_encoding, digest_error, error,
-    expected_checksums, invalid_argument, invalid_part, lock, now, owner, parse_tagging_header,
-    precondition_failed, storage_class, storage_err, ts, write_version, written_version,
+    check_conditions, check_key, check_write_conditions, checksums_of, content_encoding,
+    digest_error, error, invalid_argument, invalid_part, lock, now, owner, parse_tagging_header,
+    precondition_failed, require_length, set_checksums, sse_header, storage_class, storage_err, ts,
+    write_version, written_version,
 };
 use crate::logic::checksum::{self, Algorithm, BodyError};
 use crate::logic::listing;
@@ -119,7 +120,7 @@ pub async fn create_multipart_upload<S: Storage>(
         upload_id: Some(upload.upload_id),
         checksum_algorithm: upload.checksum_algorithm.map(ChecksumAlgorithm::from),
         checksum_type: upload.checksum_type.map(ChecksumType::from),
-        server_side_encryption: upload.meta.sse.algorithm.map(ServerSideEncryption::from),
+        server_side_encryption: sse_header(&upload.meta.sse),
         ssekms_key_id: upload.meta.sse.kms_key_id,
         sse_customer_algorithm: upload.meta.sse.customer_algorithm,
         sse_customer_key_md5: upload.meta.sse.customer_key_md5,
@@ -132,6 +133,7 @@ pub async fn upload_part<S: Storage>(
     gb: &GarbageBin<S>,
     req: S3Request<UploadPartInput>,
 ) -> S3Result<S3Response<UploadPartOutput>> {
+    require_length(&req)?;
     let trailers = Trailers::of(&req);
     let i = req.input;
     let n = part_number(i.part_number)?;
@@ -141,13 +143,7 @@ pub async fn upload_part<S: Storage>(
         .get_upload(&i.bucket, &i.key, &i.upload_id)
         .await
         .map_err(storage_err)?;
-    let expected = expected_checksums(
-        i.checksum_crc32,
-        i.checksum_crc32c,
-        i.checksum_crc64nvme,
-        i.checksum_sha1,
-        i.checksum_sha256,
-    );
+    let expected = checksums_of!(i);
     let sdk_algorithm =
         algorithm(i.checksum_algorithm.as_ref()).or(upload.checksum_algorithm.as_deref());
     // A part must carry the upload's checksum; any other could not be combined on complete.
@@ -173,6 +169,7 @@ pub async fn upload_part<S: Storage>(
         trailers,
         expected,
         sdk_algorithm,
+        always_default: upload.checksum_algorithm.is_none(),
     };
     let (blob, digests) = gb.stage(i.body, staged).await?;
     let part = PartInfo {
@@ -186,17 +183,13 @@ pub async fn upload_part<S: Storage>(
         .put_part(&i.bucket, &i.key, &i.upload_id, part.clone(), blob)
         .await
         .map_err(storage_err)?;
-    let c = &part.checksums;
-    Ok(S3Response::new(UploadPartOutput {
+    let mut out = UploadPartOutput {
         e_tag: Some(s3s::dto::ETag::Strong(part.etag.clone())),
-        checksum_crc32: c.crc32.clone(),
-        checksum_crc32c: c.crc32c.clone(),
-        checksum_crc64nvme: c.crc64nvme.clone(),
-        checksum_sha1: c.sha1.clone(),
-        checksum_sha256: c.sha256.clone(),
-        server_side_encryption: upload.meta.sse.algorithm.map(ServerSideEncryption::from),
+        server_side_encryption: sse_header(&upload.meta.sse),
         ..Default::default()
-    }))
+    };
+    set_checksums!(out, &part.checksums);
+    Ok(S3Response::new(out))
 }
 
 /// Parses `x-amz-copy-source-range: bytes=first-last` against the source size.
@@ -249,12 +242,14 @@ pub async fn upload_part_copy<S: Storage>(
         _ => e,
     })?;
     let range = copy_range(i.copy_source_range.as_deref(), meta.size)?;
-    let algorithms: Vec<Algorithm> = upload
-        .checksum_algorithm
-        .as_deref()
-        .and_then(Algorithm::parse)
-        .into_iter()
-        .collect();
+    let algorithms = checksum::or_default(
+        upload
+            .checksum_algorithm
+            .as_deref()
+            .and_then(Algorithm::parse)
+            .into_iter()
+            .collect(),
+    );
     let (stream, handle) = checksum::hashing(reader.read(range), &algorithms);
     let blob = gb.storage.write_blob(stream).await.map_err(storage_err)?;
     let digests = handle.finish();
@@ -269,18 +264,14 @@ pub async fn upload_part_copy<S: Storage>(
         .put_part(&i.bucket, &i.key, &i.upload_id, part.clone(), blob)
         .await
         .map_err(storage_err)?;
-    let c = &part.checksums;
+    let mut result = CopyPartResult {
+        e_tag: Some(s3s::dto::ETag::Strong(part.etag.clone())),
+        last_modified: Some(ts(part.last_modified)),
+        ..Default::default()
+    };
+    set_checksums!(result, &part.checksums);
     Ok(S3Response::new(UploadPartCopyOutput {
-        copy_part_result: Some(CopyPartResult {
-            e_tag: Some(s3s::dto::ETag::Strong(part.etag.clone())),
-            last_modified: Some(ts(part.last_modified)),
-            checksum_crc32: c.crc32.clone(),
-            checksum_crc32c: c.crc32c.clone(),
-            checksum_crc64nvme: c.crc64nvme.clone(),
-            checksum_sha1: c.sha1.clone(),
-            checksum_sha256: c.sha256.clone(),
-            ..Default::default()
-        }),
+        copy_part_result: Some(result),
         copy_source_version_id: gb.version_header(src_bucket, &meta).await?,
         ..Default::default()
     }))
@@ -288,13 +279,8 @@ pub async fn upload_part_copy<S: Storage>(
 
 /// A checksum the client sent for a part in the Complete body must match the stored one.
 fn part_checksums_match(sent: &CompletedPart, stored: &Checksums) -> bool {
-    let sent = expected_checksums(
-        sent.checksum_crc32.clone(),
-        sent.checksum_crc32c.clone(),
-        sent.checksum_crc64nvme.clone(),
-        sent.checksum_sha1.clone(),
-        sent.checksum_sha256.clone(),
-    );
+    let sent = sent.clone();
+    let sent = checksums_of!(sent);
     checksum::mismatch(&sent, stored).is_none()
 }
 
@@ -368,41 +354,52 @@ pub async fn complete_multipart_upload<S: Storage>(
         .retention
         .or_else(|| lock::default_retention(&info, gb.clock.now()));
     meta.checksums = Checksums::default();
-    if let Some(a) = upload
+    meta.part_checksums = Vec::new();
+    let parts: Vec<(&Checksums, u64)> = chosen.iter().map(|p| (&p.checksums, p.size)).collect();
+    // Created without a checksum, parts carry the default, combined as AWS does.
+    let explicit = upload
         .checksum_algorithm
         .as_deref()
-        .and_then(Algorithm::parse)
-    {
-        let full = upload.checksum_type.as_deref() == Some(ChecksumType::FULL_OBJECT);
-        let parts: Vec<(&Checksums, u64)> = chosen.iter().map(|p| (&p.checksums, p.size)).collect();
-        let value = if full {
-            checksum::full_object(a, &parts)
-        } else {
-            checksum::composite(a, &parts)
-        };
-        // Every part carries the upload's algorithm, so a value is always computable.
-        let Some(v) = value else {
+        .and_then(Algorithm::parse);
+    let a = explicit.unwrap_or(checksum::DEFAULT);
+    let full =
+        explicit.is_none() || upload.checksum_type.as_deref() == Some(ChecksumType::FULL_OBJECT);
+    let value = if full {
+        checksum::full_object(a, &parts)
+    } else {
+        checksum::composite(a, &parts)
+    };
+    match value {
+        // Every part carries an explicit algorithm, so a value is always computable.
+        None if explicit.is_some() => {
             return Err(error(
                 S3ErrorCode::InvalidRequest,
                 format!("A part is missing its {} checksum.", a.header()),
             ));
-        };
-        // Only the upload's own algorithm is checked; others cannot be computed from parts.
-        let sent = expected_checksums(
-            i.checksum_crc32,
-            i.checksum_crc32c,
-            i.checksum_crc64nvme,
-            i.checksum_sha1,
-            i.checksum_sha256,
-        );
-        // minio-go sends a composite value without its `-N` suffix.
-        let suffix = format!("-{}", chosen.len());
-        let matches = |s: &String| *s == v || (!full && v.strip_suffix(&suffix) == Some(s));
-        if a.get(&sent).is_some_and(|s| !matches(s)) {
-            return Err(digest_error(BodyError::Checksum(a)));
         }
-        a.set(&mut meta.checksums, Some(v));
-        meta.checksums.checksum_type = upload.checksum_type.clone();
+        // Parts stored before gb computed the default.
+        None => {}
+        Some(v) => {
+            // Only the upload's own algorithm is checked; others cannot be computed from parts.
+            let sent = checksums_of!(i);
+            // minio-go sends a composite value without its `-N` suffix.
+            let suffix = format!("-{}", chosen.len());
+            let matches = |s: &String| *s == v || (!full && v.strip_suffix(&suffix) == Some(s));
+            if a.get(&sent).is_some_and(|s| !matches(s)) {
+                return Err(digest_error(BodyError::Checksum(a)));
+            }
+            a.set(&mut meta.checksums, Some(v));
+            let t = if full {
+                ChecksumType::FULL_OBJECT
+            } else {
+                ChecksumType::COMPOSITE
+            };
+            meta.checksums.checksum_type = Some(t.to_owned());
+            meta.part_checksums = parts
+                .iter()
+                .filter_map(|(c, _)| a.get(c).cloned())
+                .collect();
+        }
     }
     gb.storage
         .complete_upload_if(
@@ -423,24 +420,20 @@ fn complete_output(
     key: String,
     meta: &ObjectMeta,
 ) -> CompleteMultipartUploadOutput {
-    let c = &meta.checksums;
-    CompleteMultipartUploadOutput {
+    let mut out = CompleteMultipartUploadOutput {
         location: Some(format!("/{bucket}/{key}")),
         bucket: Some(bucket),
         key: Some(key),
         e_tag: Some(s3s::dto::ETag::Strong(meta.etag.clone())),
-        checksum_crc32: c.crc32.clone(),
-        checksum_crc32c: c.crc32c.clone(),
-        checksum_crc64nvme: c.crc64nvme.clone(),
-        checksum_sha1: c.sha1.clone(),
-        checksum_sha256: c.sha256.clone(),
-        checksum_type: c.checksum_type.clone().map(ChecksumType::from),
-        server_side_encryption: meta.sse.algorithm.clone().map(ServerSideEncryption::from),
+        checksum_type: meta.checksums.checksum_type.clone().map(ChecksumType::from),
+        server_side_encryption: sse_header(&meta.sse),
         ssekms_key_id: meta.sse.kms_key_id.clone(),
         bucket_key_enabled: meta.sse.bucket_key_enabled,
         version_id: written_version(meta),
         ..Default::default()
-    }
+    };
+    set_checksums!(out, &meta.checksums);
+    out
 }
 
 pub async fn abort_multipart_upload<S: Storage>(
@@ -496,17 +489,16 @@ pub async fn list_parts<S: Storage>(
     let next_marker = page.last().map(|p| p.part_number as i32);
     let parts = page
         .into_iter()
-        .map(|p| Part {
-            part_number: Some(p.part_number as i32),
-            e_tag: Some(s3s::dto::ETag::Strong(p.etag)),
-            size: Some(p.size as i64),
-            last_modified: Some(ts(p.last_modified)),
-            checksum_crc32: p.checksums.crc32,
-            checksum_crc32c: p.checksums.crc32c,
-            checksum_crc64nvme: p.checksums.crc64nvme,
-            checksum_sha1: p.checksums.sha1,
-            checksum_sha256: p.checksums.sha256,
-            ..Default::default()
+        .map(|p| {
+            let mut part = Part {
+                part_number: Some(p.part_number as i32),
+                e_tag: Some(s3s::dto::ETag::Strong(p.etag)),
+                size: Some(p.size as i64),
+                last_modified: Some(ts(p.last_modified)),
+                ..Default::default()
+            };
+            set_checksums!(part, &p.checksums);
+            part
         })
         .collect();
     Ok(S3Response::new(ListPartsOutput {

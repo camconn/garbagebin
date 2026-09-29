@@ -27,7 +27,7 @@ The first release implements the operations real SDKs call during ordinary objec
 | Object Lock | PutObjectLockConfiguration, GetObjectLockConfiguration, PutObjectRetention, GetObjectRetention, PutObjectLegalHold, GetObjectLegalHold; `x-amz-bucket-object-lock-enabled` on CreateBucket; `x-amz-object-lock-mode`, `-retain-until-date` and `-legal-hold` on PutObject, CopyObject and CreateMultipartUpload, returned on GET/HEAD | GOVERNANCE and COMPLIANCE retention, legal hold, bucket default retention, `x-amz-bypass-governance-retention`. Enforced when a version is permanently deleted; delete markers and overwrites are always allowed. Retention is judged by a clock that `S3_NOW` can fix (see Container and configuration) |
 | Tagging | PutObjectTagging, GetObjectTagging, DeleteObjectTagging, PutBucketTagging, GetBucketTagging, DeleteBucketTagging | A string map on the metadata row; x-amz-tagging (URL-query-encoded) on PUT and x-amz-tagging-directive on copy. Half a day of work, no interaction with anything else |
 | Auth | SigV4 header and query (presigned URL) signing; path-style and virtual-host addressing | Lenient by default, strict verification behind a flag (see Key design decisions) |
-| Uploads | `aws-chunked` streaming bodies, `Expect: 100-continue`, `Content-MD5`, `x-amz-checksum-*` (CRC32, CRC32C, SHA1, SHA256) | These are SDK defaults, not edge cases |
+| Uploads | `aws-chunked` streaming bodies, `Expect: 100-continue`, `Content-MD5`, `x-amz-checksum-*` (CRC32, CRC32C, CRC64NVME, SHA1, SHA256, MD5, SHA512, XXHASH64, XXHASH3, XXHASH128) | These are SDK defaults, not edge cases |
 | Errors | S3 error XML with the correct HTTP status and `Code` for every implemented operation | `NoSuchBucket`, `NoSuchKey`, `BucketNotEmpty`, `InvalidPart`, `EntityTooSmall`, `PreconditionFailed`, ... |
 | Backends | `memory` (default) and `fs` (`/data` volume) | Same behaviour, chosen at startup |
 | Operability | `/health` endpoint, structured request log, `--init-buckets` to pre-create buckets | So a test harness needs no setup step |
@@ -38,7 +38,7 @@ Two tiers. **Deferred** features are designed for but not built until a real con
 
 **Deferred to a later release**
 
-Nothing at present; planned work is tracked in [TODO/](../TODO/).
+Nothing at present; planned work is tracked in [TODO/](../TODO/), and known differences from AWS in [known-differences.md](known-differences.md).
 
 **Never built**
 
@@ -47,7 +47,7 @@ Nothing at present; planned work is tracked in [TODO/](../TODO/).
 | Multi-node, clustering, replication, erasure coding | The whole point is one node. Durability is the test harness's problem, not ours. |
 | Lifecycle rules, expiration, storage classes, Glacier restore | Time-based background behaviour has no place in a deterministic test fixture. `x-amz-storage-class` is accepted and echoed so SDK calls succeed; nothing is tiered. |
 | IAM, bucket policies, ACLs, Object Ownership, block-public-access | A second product, not a feature: principals and session tokens (so STS), a JSON policy evaluator with deny-wins and condition keys, bucket policies reconciled with ACLs. A fake would be wrong in exactly the cases someone tries to test. Strict SigV4 with one key pair covers "does my service sign correctly"; if per-principal isolation is ever needed, the answer is a static key-pair-to-bucket allow-list in config, not IAM. |
-| Server-side encryption (SSE-S3, SSE-KMS, SSE-C) | Headers are accepted and echoed so SDK calls succeed; nothing is actually encrypted. |
+| Server-side encryption (SSE-S3, SSE-KMS, SSE-C) | Headers are accepted and echoed so SDK calls succeed, and objects without them report SSE-S3 (`AES256`) as AWS's default encryption does; nothing is actually encrypted. |
 | Event notifications (SNS, SQS, Lambda, EventBridge) | Would require emulating three other services. |
 | Cross-region replication, Transfer Acceleration, Access Points, Multi-Region Access Points | Multi-node or multi-service by definition. |
 | Static website hosting, CORS configuration, redirects | Different product surface; use a real web server. |
@@ -108,7 +108,7 @@ A PUT is durable and atomic at the point the metadata row commits; before that, 
 1. Stream the body to `tmp/<uuid>`, computing MD5 and SHA-256 as it passes through. Decode `aws-chunked` framing and verify any `x-amz-checksum-*` trailer.
 2. `fsync` the temp file.
 3. Take the per-key lock for `bucket/key`. A conditional write (`If-Match`, `If-None-Match`) is checked against the current version here, so two racing writers cannot both pass; it is also checked before the body is read, to fail early.
-4. `rename(tmp/<uuid>, blobs/ab/cd/<sha256>)`. If the blob already exists (same content), delete the temp file instead. Rename is the atomic step for the bytes.
+4. `rename(tmp/<uuid>, blobs/ab/cd/<sha256>)`. If the blob already exists (same content), delete the temp file instead. Rename is the atomic step for the bytes; the blob's directory, and any directory created for it, is then fsynced so the rename survives a power loss.
 5. Add the version row `{version_id, size, etag, sha256, content_type, user_meta, last_modified}` to the key's versions under `bucket\0key` in a single redb transaction, together with the blob refcounts. Commit is the atomic step for visibility.
 6. If the write replaced a version (the null version, see below), decrement its blob's refcount; delete the blob at zero.
 7. Release the lock, return `200` with the ETag.
@@ -141,7 +141,7 @@ Lock state lives on rows that already exist: a bucket row carries its lock confi
 
 **Multipart**
 
-Parts land in `uploads/<id>/` as ordinary hashed temp files. Complete validates part numbers and sizes (every part but the last must be at least 5 MB), concatenates parts into a single blob with the AWS ETag formula `md5(concat(part_md5s))-N`, then follows steps 3-7. Abort deletes the directory. Uploads with no activity for 24 hours are swept on startup only; there is no background reaper.
+Parts land in `uploads/<id>/` as ordinary hashed temp files. Complete validates part numbers and sizes (every part but the last must be at least 5 MB), takes the per-key lock so no part can be replaced or aborted mid-copy, concatenates parts into a single blob with the AWS ETag formula `md5(concat(part_md5s))-N`, then follows steps 4-7. The object row keeps each part's size and checksum for `partNumber` reads. Abort deletes the directory. Uploads with no activity for 24 hours are swept on startup only; there is no background reaper.
 
 **Memory backend**
 
@@ -206,7 +206,7 @@ The definition of "correct" is "real SDKs and existing conformance suites pass";
 1. **Ceph `s3-tests`** (the de facto S3 conformance suite) run in CI against both backends, with a checked-in allowlist of tests that fail because they exercise out-of-scope features (ACLs, lifecycle). The allowlist can only shrink.
 2. **MinIO `mint`** for a second opinion on multipart and listing edge cases.
 3. **SDK smoke tests**, one small program per SDK, each doing: create bucket, put small, put 20 MB (forces multipart), list with prefix and delimiter, range get, copy, presigned get, batch delete, delete bucket. SDKs covered: boto3, aws-sdk-go-v2, aws-sdk-js v3, aws-sdk-java v2, the AWS CLI, rclone.
-4. **Differential tests** that replay the same recorded request sequence against a real S3 bucket and this service and diff the responses, ignoring request ids and dates. Run nightly, not per commit.
+4. **Differential tests** that replay the same recorded request sequence against a real S3 bucket and this service and diff the responses, ignoring request ids and dates. Run by hand, not per commit.
 5. **Crash tests** for the fs backend: kill the process at each step of the PUT sequence, restart, assert the object is either the old one or the new one and the sweep removed orphans.
 6. **Property tests** over the listing code: random key sets, random prefix and delimiter, compared against a reference implementation in the test.
 7. **Unit tests** for SigV4 canonicalisation using AWS's published test vectors.
@@ -215,7 +215,7 @@ A change that makes any SDK smoke test fail does not merge.
 
 ## Open questions
 
-- [ ] Should the memory backend enforce a configurable size cap and return `EntityTooLarge`, or let the container OOM?
-- [ ] Is there any need for a `sleep`/latency-injection flag for testing client timeouts, or does that belong in a proxy?
-- [ ] Multipart orphan sweep on startup only, or also a `--sweep-interval` flag for long-running dev instances?
+- [x] Should the memory backend enforce a configurable size cap and return `EntityTooLarge`, or let the container OOM? No cap; the container OOMs
+- [x] Is there any need for a `sleep`/latency-injection flag for testing client timeouts, or does that belong in a proxy? No flag; use a proxy
+- [x] Multipart orphan sweep on startup only, or also a `--sweep-interval` flag for long-running dev instances? Startup only
 - [x] What triggers versioning + Object Lock leaving the deferred tier: a named internal consumer, or a failing SDK smoke test? Neither: moved in scope by decision. Both are built

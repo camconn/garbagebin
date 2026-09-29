@@ -1,34 +1,12 @@
-name: nightly
+name: merge
 
+# Slow suites: on merge to master, not per push or PR.
 on:
-  schedule:
-    - cron: "0 6 * * *"
+  push:
+    branches: [master]
   workflow_dispatch:
 
 jobs:
-  # Replays tests/differential scenarios against real S3 and gb. Needs repo secrets.
-  differential:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v6
-      - run: cargo build --release --locked
-      - name: Start gb
-        run: |
-          S3_LISTEN=127.0.0.1:9000 target/release/gb > gb.log 2>&1 &
-          timeout 30 sh -c 'until curl -fsS http://127.0.0.1:9000/health; do sleep 0.2; done'
-      - run: uv run tests/differential/diff.py
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-east-1
-          DIFF_B_ENDPOINT: http://127.0.0.1:9000
-          UV_HTTP_TIMEOUT: 300
-      - if: failure()
-        run: cat gb.log
-
   docker:
     runs-on: ubuntu-latest
     steps:
@@ -39,7 +17,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          tags: garbagebin:nightly
+          tags: garbagebin:ci
           push: false
 
   testcontainers:

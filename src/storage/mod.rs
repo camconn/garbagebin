@@ -63,12 +63,28 @@ pub enum StorageError {
 /// Checksums as base64 strings, exactly as sent on the wire.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checksums {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crc32: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crc32c: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crc64nvme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha512: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xxhash64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xxhash3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xxhash128: Option<String>,
     /// `FULL_OBJECT` or `COMPOSITE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_type: Option<String>,
 }
 
@@ -117,6 +133,9 @@ pub struct ObjectMeta {
     /// Part sizes in order for objects created by CompleteMultipartUpload; empty otherwise.
     #[serde(default)]
     pub part_sizes: Vec<u64>,
+    /// Each part's checksum in the object's algorithm; empty without one.
+    #[serde(default)]
+    pub part_checksums: Vec<String>,
     /// The upload a CompleteMultipartUpload created this object from, so a retried Complete succeeds.
     #[serde(default)]
     pub upload_id: Option<String>,
@@ -149,6 +168,7 @@ impl ObjectMeta {
             tags: Tags::new(),
             checksums: Checksums::default(),
             part_sizes: Vec::new(),
+            part_checksums: Vec::new(),
             upload_id: None,
             sse: Sse::default(),
             storage_class: None,

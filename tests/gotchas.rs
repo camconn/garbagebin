@@ -191,7 +191,12 @@ async fn etag_quoting(b: Backend) {
     assert_eq!(head.header("etag"), Some(want.as_str()));
     // Empty body: the well-known MD5.
     let r = s
-        .raw(Request::put("/bkt/empty").body(Full::default()).unwrap())
+        .raw(
+            Request::put("/bkt/empty")
+                .header("content-length", "0")
+                .body(Full::default())
+                .unwrap(),
+        )
         .await;
     assert_eq!(
         r.header("etag"),

@@ -1,0 +1,40 @@
+{
+  "ignore_headers": [],
+  "ignore_xml": [],
+  "steps": [
+    {"name": "create bucket", "method": "PUT"},
+
+    {"name": "put without checksum", "method": "PUT", "key": "plain.txt", "body": "abc"},
+    {"name": "get without checksum", "method": "GET", "key": "plain.txt", "headers": {"x-amz-checksum-mode": "ENABLED"}},
+    {"name": "put with crc32 header", "method": "PUT", "key": "crc32.txt", "body": "abc",
+     "headers": {"x-amz-sdk-checksum-algorithm": "CRC32", "x-amz-checksum-crc32": "NSRBwg=="}},
+    {"name": "head with checksum mode", "method": "HEAD", "key": "crc32.txt", "headers": {"x-amz-checksum-mode": "ENABLED"}},
+    {"name": "head without checksum mode", "method": "HEAD", "key": "crc32.txt"},
+    {"name": "put with wrong sha256 header", "method": "PUT", "key": "bad.txt", "body": "abc",
+     "headers": {"x-amz-checksum-sha256": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="}},
+    {"name": "head after bad digest", "method": "HEAD", "key": "bad.txt"},
+
+    {"name": "aws-chunked crc32 trailer", "method": "PUT", "key": "chunked-crc32.txt", "body": "hello, chunked world\n",
+     "headers": {"Content-Type": "text/plain"}, "aws_chunked": "crc32"},
+    {"name": "get aws-chunked crc32", "method": "GET", "key": "chunked-crc32.txt", "headers": {"x-amz-checksum-mode": "ENABLED"}},
+    {"name": "aws-chunked sha256 trailer", "method": "PUT", "key": "chunked-sha256.bin",
+     "body": {"random": 70000, "seed": 3}, "aws_chunked": "sha256"},
+    {"name": "get aws-chunked sha256", "method": "GET", "key": "chunked-sha256.bin", "headers": {"x-amz-checksum-mode": "ENABLED"}},
+    {"name": "aws-chunked empty body", "method": "PUT", "key": "chunked-empty", "aws_chunked": "sha1"},
+    {"name": "head aws-chunked empty", "method": "HEAD", "key": "chunked-empty", "headers": {"x-amz-checksum-mode": "ENABLED"}},
+
+    {"name": "put without content-length", "method": "PUT", "key": "unframed", "no_length": true},
+    {"name": "head after missing length", "method": "HEAD", "key": "unframed"},
+
+    {"name": "presigned put", "method": "PUT", "key": "presigned.txt", "body": "via a presigned url\n", "presign": {}},
+    {"name": "presigned get", "method": "GET", "key": "presigned.txt", "presign": {}},
+    {"name": "presigned head missing key", "method": "HEAD", "key": "nope", "presign": {}},
+    {"name": "presigned get bad signature", "method": "GET", "key": "presigned.txt", "presign": {"tamper": true},
+     "ignore_xml": ["AWSAccessKeyId", "StringToSign", "StringToSignBytes", "SignatureProvided", "CanonicalRequest",
+                    "CanonicalRequestBytes"]},
+
+    {"name": "delete objects", "method": "POST", "query": {"delete": ""}, "content_md5": true,
+     "body": "<Delete><Quiet>true</Quiet><Object><Key>plain.txt</Key></Object><Object><Key>crc32.txt</Key></Object><Object><Key>chunked-crc32.txt</Key></Object><Object><Key>chunked-sha256.bin</Key></Object><Object><Key>chunked-empty</Key></Object><Object><Key>presigned.txt</Key></Object></Delete>"},
+    {"name": "delete bucket", "method": "DELETE"}
+  ]
+}

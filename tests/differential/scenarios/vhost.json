@@ -1,0 +1,22 @@
+{
+  "ignore_headers": [],
+  "ignore_xml": [],
+  "steps": [
+    {"name": "create bucket", "method": "PUT", "vhost": true},
+    {"name": "head bucket", "method": "HEAD", "vhost": true},
+    {"name": "put", "method": "PUT", "key": "dir/a.txt", "body": "virtual host\n", "vhost": true,
+     "headers": {"Content-Type": "text/plain", "x-amz-meta-style": "vhost"}},
+    {"name": "put key with space", "method": "PUT", "key": "dir/b c.txt", "body": "b", "vhost": true},
+    {"name": "get", "method": "GET", "key": "dir/a.txt", "vhost": true},
+    {"name": "head", "method": "HEAD", "key": "dir/a.txt", "vhost": true},
+    {"name": "get path-style after vhost put", "method": "GET", "key": "dir/a.txt"},
+    {"name": "get missing key", "method": "GET", "key": "nope", "vhost": true},
+    {"name": "list v2", "method": "GET", "query": {"list-type": "2", "prefix": "dir/"}, "vhost": true},
+    {"name": "list v2 delimiter", "method": "GET", "query": {"list-type": "2", "delimiter": "/"}, "vhost": true},
+    {"name": "delete", "method": "DELETE", "key": "dir/a.txt", "vhost": true},
+    {"name": "delete other", "method": "DELETE", "key": "dir/b c.txt", "vhost": true},
+    {"name": "head deleted", "method": "HEAD", "key": "dir/a.txt", "vhost": true},
+    {"name": "delete bucket", "method": "DELETE", "vhost": true},
+    {"name": "head deleted bucket", "method": "HEAD", "vhost": true}
+  ]
+}

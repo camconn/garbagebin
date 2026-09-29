@@ -375,8 +375,52 @@ async fn virtual_host_signatures(b: Backend) {
     assert_eq!(out.key_count(), Some(1));
 }
 
+/// XML body digests are judged only once the signature verifies, as on AWS.
+async fn digest_checked_after_auth(b: Backend) {
+    let s = strict(b).await;
+    s.client()
+        .create_bucket()
+        .bucket("bkt")
+        .send()
+        .await
+        .unwrap();
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key("a")
+                .value("b")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    // Added before signing, so it is signed.
+    let put = |c: aws_sdk_s3::Client| {
+        let tagging = tagging.clone();
+        async move {
+            c.put_bucket_tagging()
+                .bucket("bkt")
+                .tagging(tagging)
+                .customize()
+                .mutate_request(|r| {
+                    r.headers_mut()
+                        .insert("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==");
+                })
+                .send()
+                .await
+                .unwrap_err()
+        }
+    };
+    let e = put(s.client()).await;
+    assert_eq!(code(&e), "BadDigest");
+    let e = put(s.client_with("AKIDSTRICT", "wrong")).await;
+    assert_eq!(code(&e), "SignatureDoesNotMatch");
+    assert_eq!(status(&e), 403);
+}
+
 backend_tests!(
     accepts_good_signatures,
+    digest_checked_after_auth,
     rejects_bad_credentials,
     wrong_region_rejected,
     presigned,
