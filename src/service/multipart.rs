@@ -564,8 +564,9 @@ pub async fn list_multipart_uploads<S: Storage>(
     let mut last: Option<(String, Option<String>)> = None;
     for u in uploads {
         let cp = listing::common_prefix(&u.key, &prefix, delimiter.as_deref());
+        // A prefix at or before the marker was returned on an earlier page.
         if let Some(cp) = cp
-            && prefixes.last().is_some_and(|p| p == cp)
+            && (cp <= key_marker.as_str() || prefixes.last().is_some_and(|p| p == cp))
         {
             continue;
         }

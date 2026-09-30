@@ -6,7 +6,9 @@ use s3s::dto::{
 };
 use s3s::{S3ErrorCode, S3Request, S3Response, S3Result};
 
-use super::{GarbageBin, TagTarget, error, read_err, storage_err, validate_tags, version_param};
+use super::{
+    GarbageBin, TagTarget, error, insert_tag, read_err, storage_err, validate_tags, version_param,
+};
 use crate::storage::{ObjectMeta, Storage, Tags};
 
 /// Replaces the tag set of the named or current version; returns its `x-amz-version-id`.
@@ -33,13 +35,11 @@ async fn set_tags<S: Storage>(
 fn to_tags(t: Tagging, target: TagTarget) -> S3Result<Tags> {
     let mut tags = Tags::new();
     for Tag { key, value } in t.tag_set {
-        let key = key.unwrap_or_default();
-        if tags.insert(key, value.unwrap_or_default()).is_some() {
-            return Err(error(
-                S3ErrorCode::InvalidTag,
-                "Cannot provide multiple Tags with the same key",
-            ));
-        }
+        insert_tag(
+            &mut tags,
+            key.unwrap_or_default(),
+            value.unwrap_or_default(),
+        )?;
     }
     validate_tags(&tags, target)?;
     Ok(tags)

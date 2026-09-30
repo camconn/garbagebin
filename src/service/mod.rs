@@ -514,11 +514,22 @@ async fn check_write_conditions<S: Storage>(
 
 /// Parses an `x-amz-tagging` header (URL query encoded).
 fn parse_tagging_header(header: Option<&str>) -> S3Result<Tags> {
-    let tags: Tags = header
-        .map(|h| form_urlencoded::parse(h.as_bytes()).into_owned().collect())
-        .unwrap_or_default();
+    let mut tags = Tags::new();
+    for (k, v) in form_urlencoded::parse(header.unwrap_or_default().as_bytes()).into_owned() {
+        insert_tag(&mut tags, k, v)?;
+    }
     validate_tags(&tags, TagTarget::Object)?;
     Ok(tags)
+}
+
+fn insert_tag(tags: &mut Tags, key: String, value: String) -> S3Result<()> {
+    if tags.insert(key, value).is_some() {
+        return Err(error(
+            S3ErrorCode::InvalidTag,
+            "Cannot provide multiple Tags with the same key",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
