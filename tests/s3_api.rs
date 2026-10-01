@@ -3208,6 +3208,86 @@ async fn tag_limits(b: Backend) {
     put_object(10).await.unwrap();
     let e = put_object(11).await.unwrap_err();
     assert_eq!(code(&e), "InvalidTag");
+
+    // Duplicate keys in x-amz-tagging, on every request that takes it.
+    let dup = "team=one&team=two";
+    let e = c
+        .put_object()
+        .bucket("bkt")
+        .key("dup")
+        .body(ByteStream::from_static(b"x"))
+        .tagging(dup)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), "InvalidTag");
+    let e = c
+        .create_multipart_upload()
+        .bucket("bkt")
+        .key("dup")
+        .tagging(dup)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), "InvalidTag");
+    let e = c
+        .copy_object()
+        .bucket("bkt")
+        .key("dup")
+        .copy_source("bkt/k")
+        .tagging_directive(TaggingDirective::Replace)
+        .tagging(dup)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), "InvalidTag");
+}
+
+/// Paging uploads by one with a delimiter visits each prefix once.
+async fn multipart_uploads_pages(b: Backend) {
+    let s = start(b).await;
+    let c = s.client();
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    for key in ["a/one", "a/two", "b/one", "c"] {
+        c.create_multipart_upload()
+            .bucket("bkt")
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    let (mut key_marker, mut id_marker) = (None, None);
+    for _ in 0..10 {
+        let page = c
+            .list_multipart_uploads()
+            .bucket("bkt")
+            .delimiter("/")
+            .max_uploads(1)
+            .set_key_marker(key_marker)
+            .set_upload_id_marker(id_marker)
+            .send()
+            .await
+            .unwrap();
+        seen.extend(
+            page.common_prefixes()
+                .iter()
+                .filter_map(|p| p.prefix())
+                .map(str::to_owned),
+        );
+        seen.extend(
+            page.uploads()
+                .iter()
+                .filter_map(|u| u.key())
+                .map(str::to_owned),
+        );
+        if page.is_truncated() != Some(true) {
+            break;
+        }
+        key_marker = page.next_key_marker().map(str::to_owned);
+        id_marker = page.next_upload_id_marker().map(str::to_owned);
+    }
+    assert_eq!(seen, ["a/", "b/", "c"]);
 }
 
 async fn health_names_are_buckets_too(b: Backend) {
@@ -3394,6 +3474,7 @@ backend_tests!(
     composite_checksum_without_part_count,
     concurrent_conditional_writes,
     tag_limits,
+    multipart_uploads_pages,
     health_names_are_buckets_too,
     copy_of_multipart_is_single_part,
     copy_errors_name_the_source,
