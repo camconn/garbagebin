@@ -7,7 +7,7 @@ export class GarbageBinContainer extends GenericContainer {
   #accessKey = "test";
   #secretKey = "test";
 
-  constructor(image = "garbagebin:latest") {
+  constructor(image = "camconn/garbagebin:latest") {
     super(image);
     this.withExposedPorts(PORT)
       .withEnvironment({ S3_BACKEND: "memory", S3_ACCESS_KEY: "test", S3_SECRET_KEY: "test" })

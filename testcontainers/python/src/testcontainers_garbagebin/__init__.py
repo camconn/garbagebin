@@ -9,7 +9,7 @@ PORT = 9000
 class GarbageBinContainer(DockerContainer):
     def __init__(
         self,
-        image: str = "garbagebin:latest",
+        image: str = "camconn/garbagebin:latest",
         backend: str = "memory",
         init_buckets: list[str] | None = None,
         access_key: str = "test",

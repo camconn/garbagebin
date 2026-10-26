@@ -21,9 +21,11 @@ func TestPutGet(t *testing.T) {
 		garbagebin.WithCredentials("gbaccess", "gbsecret123"),
 		garbagebin.WithEnv("S3_STRICT_AUTH", "true"), // proves the credentials reach the server
 	}
-	if img := os.Getenv("GB_TEST_IMAGE"); img != "" {
-		opts = append(opts, garbagebin.WithImage(img))
+	img := os.Getenv("GB_TEST_IMAGE")
+	if img == "" {
+		img = "garbagebin:latest"
 	}
+	opts = append(opts, garbagebin.WithImage(img))
 	ctr, err := garbagebin.Run(ctx, opts...)
 	t.Cleanup(func() { _ = ctr.Terminate(ctx) })
 	if err != nil {

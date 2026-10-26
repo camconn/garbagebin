@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	DefaultImage = "garbagebin:latest"
+	DefaultImage = "camconn/garbagebin:latest"
 	port         = "9000/tcp"
 )
 

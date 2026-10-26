@@ -10,11 +10,11 @@ work.
 
 ### Docker
 
-The image is not published yet; build it first.
+Published to Docker Hub as [`camconn/garbagebin`](https://hub.docker.com/r/camconn/garbagebin) for amd64 and
+arm64: `latest` is the newest release, `edge` tracks `master`.
 
 ```sh
-docker build -t garbagebin .
-docker run --rm -p 9000:9000 garbagebin
+docker run --rm -p 9000:9000 camconn/garbagebin
 
 export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
 aws --endpoint-url http://localhost:9000 s3 mb s3://my-bucket
@@ -33,7 +33,7 @@ deterministic.
 ```yaml
 services:
   s3:
-    image: garbagebin
+    image: camconn/garbagebin
     ports: ["9000:9000"]
     environment:
       S3_INIT_BUCKETS: uploads,exports
@@ -69,7 +69,7 @@ table in [docs/design.md](docs/design.md#container-and-configuration) for every 
 ### Testcontainers
 
 Modules for Go, Python, Java and JS live in [testcontainers/](testcontainers/) (not yet published to package
-registries). Each starts the `garbagebin` image (configurable), waits on `/health`, takes options for the
+registries). Each starts `camconn/garbagebin:latest` (configurable), waits on `/health`, takes options for the
 backend, init buckets and credentials, and exposes the endpoint, access key and secret key:
 
 ```go
@@ -108,8 +108,8 @@ docker build -t garbagebin .
 Smoke tests need uv, Go, Node, Java, the AWS CLI v2 and rclone. Every script reads `S3_ENDPOINT`,
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (default `test`/`test`), so they also run against any other
 S3 endpoint. CI runs fmt, clippy, tests and smoke tests on every push ([ci.yml](.github/workflows/ci.yml)),
-conformance suites on push and PR ([conformance.yml](.github/workflows/conformance.yml)), and the
-multi-arch image build and Testcontainers module tests on merge to `master`
+conformance suites on push and PR ([conformance.yml](.github/workflows/conformance.yml)), and
+Testcontainers module tests then the multi-arch image push to Docker Hub on merge to `master` and on `v*` tags
 ([merge.yml](.github/workflows/merge.yml)). The differential tests are run by hand.
 
 ## License

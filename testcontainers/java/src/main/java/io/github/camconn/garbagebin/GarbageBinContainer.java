@@ -6,7 +6,7 @@ import org.testcontainers.utility.DockerImageName;
 
 /** Testcontainers module for the Garbage Bin S3 server. */
 public class GarbageBinContainer extends GenericContainer<GarbageBinContainer> {
-    public static final String DEFAULT_IMAGE = "garbagebin:latest";
+    public static final String DEFAULT_IMAGE = "camconn/garbagebin:latest";
     private static final int PORT = 9000;
 
     private String accessKey = "test";
