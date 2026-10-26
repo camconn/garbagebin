@@ -14,7 +14,7 @@ Published to Docker Hub as [`camconn/garbagebin`](https://hub.docker.com/r/camco
 arm64: `latest` is the newest release, `edge` tracks `master`.
 
 ```sh
-docker run --rm -p 9000:9000 camconn/garbagebin
+docker run --rm -p 9000:9000 camconn/garbagebin:latest
 
 export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
 aws --endpoint-url http://localhost:9000 s3 mb s3://my-bucket
@@ -33,7 +33,7 @@ deterministic.
 ```yaml
 services:
   s3:
-    image: camconn/garbagebin
+    image: camconn/garbagebin:latest
     ports: ["9000:9000"]
     environment:
       S3_INIT_BUCKETS: uploads,exports
