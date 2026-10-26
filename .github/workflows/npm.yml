@@ -1,0 +1,29 @@
+name: npm
+
+# Publishes testcontainers/js via npm trusted publishing (OIDC); no token.
+on:
+  push:
+    tags: ['testcontainers/js/v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: testcontainers/js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs a recent npm.
+      - run: npm install -g npm@latest
+      - name: Tag matches package.json
+        run: test "${GITHUB_REF_NAME#testcontainers/js/v}" = "$(node -p 'require("./package.json").version')"
+      - run: docker build -t garbagebin:latest ../..
+      - run: npm ci && npm test
+      - run: npm publish --access public
