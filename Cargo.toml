@@ -1,6 +1,6 @@
 [package]
 name = "garbagebin"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.96"
 description = "Garbage Bin: a single-node, S3-compatible object store for local development and integration tests"

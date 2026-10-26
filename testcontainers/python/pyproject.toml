@@ -1,7 +1,8 @@
 [project]
 name = "testcontainers-garbagebin"
-version = "0.1.0"
+version = "0.5.1"
 description = "Testcontainers module for the Garbage Bin S3 server"
+readme = "README.md"
 license = "AGPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = ["testcontainers>=4.15"]

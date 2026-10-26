@@ -60,8 +60,9 @@ Environment variables or flags (`gb --help`). All settings:
 
 ### Testcontainers
 
-Modules for Go, Python, Java and JS in [testcontainers/](testcontainers/), defaulting to
-`camconn/garbagebin:latest`:
+Modules defaulting to `camconn/garbagebin:latest`; install and usage in each README:
+[Go](testcontainers/go/README.md), [Python](testcontainers/python/README.md),
+[Java](testcontainers/java/README.md), [JS](testcontainers/js/README.md).
 
 ```go
 ctr, err := garbagebin.Run(ctx, garbagebin.WithInitBuckets("uploads"))
