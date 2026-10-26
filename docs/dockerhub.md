@@ -1,11 +1,12 @@
 # Garbage Bin
 
-A single-process, S3-compatible object store for local development and integration tests. Unmodified AWS SDKs
-work against it with only an endpoint override. Static binary on `scratch`, starts in well under a second.
+A single-process, S3-compatible object store that runs as one Docker container for local development and testing.
 
 Source, docs and issues: <https://github.com/camconn/garbagebin>
 
 ## Tags
+
+Use `camconn/garbagebin:latest` unless you need a pinned version.
 
 - `latest`: newest release
 - `X.Y.Z`, `X.Y`: releases
@@ -63,7 +64,7 @@ services:
 | `S3_INIT_BUCKETS` | (none) | Comma-separated, created at startup |
 | `S3_VHOST_DOMAIN` | (none) | e.g. `localhost` makes `mybucket.localhost` address `mybucket` |
 | `S3_LOG` | `info` | JSON to stdout |
-| `S3_NOW` | (system time) | Fixed RFC 3339 instant for Object Lock retention, for deterministic tests |
+| `S3_NOW` | (system time) | RFC 3339 instant that fixes the clock for Object Lock, to permit manual clocks |
 
 Full details in the [design doc](https://github.com/camconn/garbagebin/blob/master/docs/design.md#container-and-configuration).
 

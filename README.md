@@ -1,17 +1,14 @@
 # Garbage Bin
 
-A single-process, S3-compatible object store that runs as one Docker container for local development and
-integration tests. Unmodified AWS SDKs work against it with only an endpoint override.
+A single-process, S3-compatible object store that runs as one Docker container for local development and testing.
 
-Package `garbagebin`, binary `gb`. See the [design doc](docs/design.md) for rationale and [TODO/](TODO/) for deferred
-work.
+Package `garbagebin`, binary `gb`.
 
 ## Usage
 
 ### Docker
 
-Published to Docker Hub as [`camconn/garbagebin`](https://hub.docker.com/r/camconn/garbagebin) for amd64 and
-arm64: `latest` is the newest release, `edge` tracks `master`.
+[`camconn/garbagebin:latest`](https://hub.docker.com/r/camconn/garbagebin) (amd64, arm64). `edge` tracks `master`.
 
 ```sh
 docker run --rm -p 9000:9000 camconn/garbagebin:latest
@@ -22,11 +19,8 @@ aws --endpoint-url http://localhost:9000 s3 cp README.md s3://my-bucket/
 aws --endpoint-url http://localhost:9000 s3 ls s3://my-bucket
 ```
 
-Any credentials work unless strict auth is on (`S3_STRICT_AUTH=true` checks them against `S3_ACCESS_KEY` /
-`S3_SECRET_KEY`). Use path-style addressing, or set `S3_VHOST_DOMAIN` for virtual-host style. `GET /health`
-returns 200 once the server is ready.
-`S3_NOW` (an RFC 3339 instant) fixes the clock Object Lock judges retention by, so retention tests are
-deterministic.
+Any credentials work unless `S3_STRICT_AUTH=true`. Path-style by default; set `S3_VHOST_DOMAIN` for
+virtual-host style.
 
 ### docker-compose
 
@@ -53,24 +47,21 @@ services:
 
 ### Bare binary
 
-No Docker needed, e.g. on CI runners:
-
 ```sh
 cargo build --release
-target/release/gb --backend memory
-target/release/gb --backend fs --data-dir ./data --listen 127.0.0.1:9000
+target/release/gb --backend memory # run in-memory
+target/release/gb --backend fs --data-dir ./data --listen 127.0.0.1:9000 # run and store on fs
 ```
 
 ### Configuration
 
-Environment variables, or the matching flags (`gb --help`); there is no config file. See the configuration
-table in [docs/design.md](docs/design.md#container-and-configuration) for every setting and its default.
+Environment variables or flags (`gb --help`). All settings:
+[docs/design.md](docs/design.md#container-and-configuration).
 
 ### Testcontainers
 
-Modules for Go, Python, Java and JS live in [testcontainers/](testcontainers/) (not yet published to package
-registries). Each starts `camconn/garbagebin:latest` (configurable), waits on `/health`, takes options for the
-backend, init buckets and credentials, and exposes the endpoint, access key and secret key:
+Modules for Go, Python, Java and JS in [testcontainers/](testcontainers/), defaulting to
+`camconn/garbagebin:latest`:
 
 ```go
 ctr, err := garbagebin.Run(ctx, garbagebin.WithInitBuckets("uploads"))
@@ -84,8 +75,6 @@ defer ctr.Terminate(ctx)
 
 ## Development
 
-The toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
-
 ```sh
 cargo build
 cargo test
@@ -95,27 +84,16 @@ docker build -t garbagebin .
 
 ## Testing
 
-| Command | What it does |
-| --- | --- |
-| `cargo test` | Unit and integration tests |
-| `scripts/smoke.sh [--backend memory\|fs] [sdk...]` | SDK smoke tests in [tests/smoke/](tests/smoke/) (boto3, aws-sdk-go-v2, aws-sdk-js v3, aws-sdk-java v2, AWS CLI, rclone), in parallel. Builds and starts `gb` on a free port unless `S3_ENDPOINT` is set. The merge gate. |
-| `scripts/s3-tests.sh` | Ceph s3-tests against `S3_ENDPOINT`; failures must be listed in [tests/s3-tests/allowlist.txt](tests/s3-tests/allowlist.txt), which can only shrink |
-| `scripts/mint.sh` | MinIO mint (Docker) against `S3_ENDPOINT` |
-| `uv run tests/differential/diff.py [-v] [scenario.json...]` | Replays the scenarios in [tests/differential/scenarios/](tests/differential/scenarios/) (all by default) against side A (real S3, using `AWS_*` credentials) and side B (`DIFF_B_ENDPOINT`, default `http://localhost:9000`) and diffs the responses, ignoring request ids and dates. `DIFF_A_ENDPOINT` points side A at another server instead. Run side B with strict auth (the scenarios include bad signatures) and `S3_VHOST_DOMAIN` set to its endpoint's host, e.g. `localhost` (steps with `"vhost": true` address `<bucket>.<endpoint host>`). `DIFF_A_REGION`/`DIFF_B_REGION` pick each side's region; outside `us-east-1`, CreateBucket sends a `LocationConstraint`. Side A's stale `gb-diff-*` buckets (older than `STALE_AFTER`) are deleted first, as left over from a killed run |
-| `go test ./...`, `uv run pytest`, `npm ci && npm test`, `./gradlew test` | Testcontainers module tests, run in each `testcontainers/<lang>/` directory against the local `garbagebin` image (`GB_TEST_IMAGE` overrides) |
+```sh
+cargo test
+scripts/smoke.sh   # SDK smoke tests; the merge gate
+```
 
-`s3-tests.sh` and `mint.sh` need a running server (e.g. `target/release/gb`); `mint.sh` also needs Docker.
-Smoke tests need uv, Go, Node, Java, the AWS CLI v2 and rclone. Every script reads `S3_ENDPOINT`,
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (default `test`/`test`), so they also run against any other
-S3 endpoint. CI runs fmt, clippy, tests and smoke tests on every push ([ci.yml](.github/workflows/ci.yml)),
-conformance suites on push and PR ([conformance.yml](.github/workflows/conformance.yml)), and
-Testcontainers module tests then the multi-arch image push to Docker Hub on merge to `master` and on `v*` tags
-([merge.yml](.github/workflows/merge.yml)). The differential tests are run by hand.
+Conformance suites, differential tests, prerequisites and CI: [docs/testing.md](docs/testing.md).
 
 ## License
 
 Copyright (C) 2026 Cameron Conn
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero
-General Public License as published by the Free Software Foundation, either version 3 of the License, or (at
-your option) any later version. See [LICENSE](LICENSE) for the full text.
+This program is distributed under the GNU Affero General Public License, version 3 or (at your option) any
+later version. See [LICENSE](LICENSE) for the full text.
