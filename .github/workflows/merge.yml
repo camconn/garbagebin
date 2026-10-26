@@ -66,3 +66,9 @@ jobs:
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_USERNAME }}/garbagebin
+          readme-filepath: docs/dockerhub.md
