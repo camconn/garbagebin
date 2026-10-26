@@ -8,7 +8,7 @@
 Not on Maven Central yet; install to your local Maven repository from source (needs JDK 25):
 
 ```sh
-git clone --branch v0.5.1 https://github.com/camconn/garbagebin
+git clone https://github.com/camconn/garbagebin
 cd garbagebin/testcontainers/java
 ./gradlew publishToMavenLocal
 ```
@@ -16,7 +16,7 @@ cd garbagebin/testcontainers/java
 Then depend on it, with `mavenLocal()` in your repositories:
 
 ```groovy
-testImplementation 'io.github.camconn:testcontainers-garbagebin:0.5.1'
+testImplementation 'cc.camconn.garbagebin:testcontainers-garbagebin:0.5.1'
 ```
 
 It brings in `org.testcontainers:testcontainers` as an API dependency. Docker must be available.

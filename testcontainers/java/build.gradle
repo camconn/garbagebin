@@ -3,7 +3,7 @@ plugins {
     id 'maven-publish'
 }
 
-group = 'io.github.camconn'
+group = 'cc.camconn.garbagebin'
 version = '0.5.1'
 
 java {
