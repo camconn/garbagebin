@@ -1,0 +1,27 @@
+name: pypi
+
+# Publishes testcontainers/python via PyPI trusted publishing (OIDC); no token.
+on:
+  push:
+    tags: ['testcontainers/python/v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: testcontainers/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Tag matches pyproject.toml
+        run: test "${GITHUB_REF_NAME#testcontainers/python/v}" = "$(uv version --short)"
+      - run: docker build -t garbagebin:latest ../..
+      - run: uv run pytest -q
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: testcontainers/python/dist/

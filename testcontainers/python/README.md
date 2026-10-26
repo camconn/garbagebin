@@ -5,12 +5,10 @@
 
 ## Install
 
-Not on PyPI yet; install from git:
-
 ```sh
-uv add --dev "testcontainers-garbagebin @ git+https://github.com/camconn/garbagebin@v0.5.1#subdirectory=testcontainers/python"
+uv add --dev testcontainers-garbagebin
 # or
-pip install "testcontainers-garbagebin @ git+https://github.com/camconn/garbagebin@v0.5.1#subdirectory=testcontainers/python"
+pip install testcontainers-garbagebin
 ```
 
 Requires Python >= 3.10 and Docker.
